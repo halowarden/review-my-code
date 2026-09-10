@@ -600,16 +600,120 @@ export function buildScopeLine({ reviewedPaths = [], ignoredPaths = [], emptyPat
   return parts.join(" — ");
 }
 
-export function buildMainComment({ summary, findings, passed, scope, tags = [] }) {
+const CATEGORY_NAMES = {
+  "🐛": "Correctness",
+  "🔒": "Security",
+  "🧪": "Tests",
+  "🧱": "Architecture",
+  "⚡": "Performance",
+  "🔄": "Compatibility",
+  "🛡": "Reliability",
+  "🔭": "Observability",
+  "🧹": "Maintainability",
+};
+const CATEGORY_ORDER = ["🐛", "🔒", "🧪", "🧱", "⚡", "🔄", "🛡", "🔭", "🧹"];
+
+function stripVariationSelectors(text) {
+  return text.replace(/\uFE0F/g, "");
+}
+
+/**
+ * Parses a finding line in the protocol format
+ * "<severity> <category> **title** — path:line — details" into its parts.
+ * Anything that does not match is kept as a raw line.
+ */
+export function parseFinding(line) {
+  const raw = String(line).trim();
+  const parts = raw.split(/\s+—\s+/);
+  const head = parts[0] ?? "";
+  const match = head.match(/^(🔴|🟡)\s*(\S+)\s*\*\*(.+?)\*\*\s*$/u);
+  if (!match || parts.length < 2) {
+    return { raw, severity: raw.startsWith("🔴") ? "🔴" : raw.startsWith("🟡") ? "🟡" : null, category: null, title: raw, location: null, details: "" };
+  }
+  const category = stripVariationSelectors(match[2]);
+  let location = null;
+  let details;
+  if (parts.length >= 3) {
+    location = parts[1].trim();
+    details = parts.slice(2).join(" — ").trim();
+  } else {
+    details = parts[1].trim();
+  }
+  return {
+    raw,
+    severity: match[1],
+    category: CATEGORY_NAMES[category] ? category : null,
+    title: match[3].trim(),
+    location,
+    details,
+  };
+}
+
+function locationLink(location, { owner, repo, headSha }) {
+  if (!location) {
+    return "";
+  }
+  const match = location.match(/^([^\s:]+?)(?::(\d+))?$/);
+  if (match && owner && repo && headSha) {
+    const [, path, line] = match;
+    const anchor = line ? `#L${line}` : "";
+    return `<a href="https://github.com/${owner}/${repo}/blob/${headSha}/${path}${anchor}"><code>${location}</code></a>`;
+  }
+  return `<code>${location}</code>`;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function buildCategoryTable(parsedFindings) {
+  const rows = CATEGORY_ORDER.map((emoji) => {
+    const inCategory = parsedFindings.filter((finding) => finding.category === emoji);
+    const blocking = inCategory.filter((finding) => finding.severity === "🔴").length;
+    const followUps = inCategory.length - blocking;
+    let status = "✅ Clean";
+    if (blocking && followUps) {
+      status = `❌ ${blocking} blocking, ${followUps} follow-up${followUps === 1 ? "" : "s"}`;
+    } else if (blocking) {
+      status = `❌ ${blocking} blocking`;
+    } else if (followUps) {
+      status = `⚠️ ${followUps} issue${followUps === 1 ? "" : "s"}`;
+    }
+    const label = emoji === "🛡" ? "🛡️" : emoji;
+    return `| ${label} ${CATEGORY_NAMES[emoji]} | ${status} |`;
+  });
+  const uncategorized = parsedFindings.filter((finding) => !finding.category).length;
+  if (uncategorized) {
+    rows.push(`| ❔ Uncategorized | ⚠️ ${uncategorized} issue${uncategorized === 1 ? "" : "s"} |`);
+  }
+  return ["| Category | Status |", "|---|---|", ...rows].join("\n");
+}
+
+export function buildMainComment({ summary, findings, passed, scope, tags = [], owner, repo, headSha }) {
   const emoji = passed ? "✅" : "❌";
-  const heading = `${emoji} AI Review ${passed ? "Passed" : "Needs Attention"}`;
-  const findingsBlock =
-    findings.length === 0 ? "- No actionable issues found." : findings.map((item) => `- ${item}`).join("\n");
+  const heading = `## ${emoji} AI Review ${passed ? "Passed" : "Needs Attention"}`;
+  const parsed = findings.map(parseFinding);
   const sections = [heading];
   if (scope) {
     sections.push(`_${scope}_`);
   }
-  sections.push(summary, `**Findings**\n${findingsBlock}`);
+  sections.push(summary);
+
+  if (parsed.length === 0) {
+    sections.push("**Findings**\n- No actionable issues found.");
+  } else {
+    sections.push(buildCategoryTable(parsed));
+    const blocks = parsed.map((finding) => {
+      if (!finding.severity || !finding.details) {
+        return `- ${finding.raw}`;
+      }
+      const category = finding.category ? `${finding.category === "🛡" ? "🛡️" : finding.category} ` : "";
+      const where = finding.location ? ` — ${locationLink(finding.location, { owner, repo, headSha })}` : "";
+      return `<details>\n<summary>${finding.severity} ${category}<b>${escapeHtml(finding.title)}</b>${where}</summary>\n\n${finding.details}\n\n</details>`;
+    });
+    sections.push(`**Findings (${parsed.length})**\n\n${blocks.join("\n")}`);
+  }
+
   if (tags.length) {
     sections.push(`Tags: ${tags.map((tag) => `\`${tag}\``).join(", ")}`);
   }

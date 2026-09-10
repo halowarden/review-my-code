@@ -11,10 +11,15 @@ Cloudflare Worker GitHub bot for AI-powered pull request review.
   splits what is left at file and hunk boundaries, and sends it to the AI endpoint
 - One chunk → one AI call and done. Several chunks → one call per chunk plus a final
   adjudication call that merges duplicates and derives the verdict
-- Posts one main PR comment (verdict, scope line, findings, tags) and inline review
-  comments on lines that exist in the diff
-- Applies `ai-reviewed` plus `ai-review:passed` or `ai-review:needs-fixes`, removes the
-  opposite result label, and reacts 👍/👎 on the main comment
+- Posts one PR review whose body is the summary (verdict, scope line, category table,
+  collapsible findings linked to the diff, tags) and whose inline comments sit on lines
+  that exist in the diff
+- Keeps that single review per PR: later pushes update its body in place, delete the
+  bot's previous inline comments, and attach refreshed inline comments to a short
+  follow-up review (GitHub cannot add inline comments to an already submitted review)
+- Reacts on the PR itself: 👀 while the review runs, then 👍/👎, or 😕 if it failed
+- Applies `ai-reviewed` plus `ai-review:passed` or `ai-review:needs-fixes` and removes the
+  opposite result label
 
 ## Cost model
 

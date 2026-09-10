@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildAIRequestBody,
+  buildCategoryTable,
   buildMainComment,
   buildScopeLine,
   createChunkPrompt,
@@ -11,6 +12,7 @@ import {
   filterDiff,
   parseAIParams,
   parseAIResponse,
+  parseFinding,
   resolveAIFormat,
   resolveAIRequestUrl,
   resolveReviewSettings,
@@ -61,7 +63,15 @@ const BASE_PAYLOAD = {
  * Installs a fetch mock. `ai` can be a function (prompt) => response object,
  * and `diff` is the text returned for the PR diff request.
  */
-function mockFetch({ diff = SIMPLE_DIFF, ai, pullJson = {}, labelsStatus = 200 } = {}) {
+function mockFetch({
+  diff = SIMPLE_DIFF,
+  ai,
+  pullJson = {},
+  labelsStatus = 200,
+  reactions = [],
+  existingReviews = [],
+  existingInline = [],
+} = {}) {
   const calls = [];
   const originalFetch = global.fetch;
   global.fetch = async (url, options = {}) => {
@@ -81,8 +91,17 @@ function mockFetch({ diff = SIMPLE_DIFF, ai, pullJson = {}, labelsStatus = 200 }
     if (url.endsWith("/pulls/12")) {
       return Response.json(pullJson);
     }
-    if (url.includes("/issues/12/comments")) {
-      return Response.json({ id: 99 });
+    if (url.endsWith("/user")) {
+      return Response.json({ login: "review-bot" });
+    }
+    if (url.includes("/pulls/12/reviews?") && options.method !== "POST") {
+      return Response.json(existingReviews);
+    }
+    if (url.includes("/pulls/12/comments?") && options.method !== "POST") {
+      return Response.json(existingInline);
+    }
+    if (url.includes("/issues/12/reactions") && options.method !== "POST" && options.method !== "DELETE") {
+      return Response.json(reactions);
     }
     if (url.includes("/issues/12/labels")) {
       return new Response(labelsStatus === 200 ? "{}" : "missing labels", { status: labelsStatus });
@@ -90,6 +109,21 @@ function mockFetch({ diff = SIMPLE_DIFF, ai, pullJson = {}, labelsStatus = 200 }
     return Response.json({});
   };
   return { calls, restore: () => (global.fetch = originalFetch) };
+}
+
+function reviewCalls(calls) {
+  return calls.filter((call) => call.url.includes("/pulls/12/reviews") && call.options.method === "POST");
+}
+
+function postedReviewBody(calls) {
+  const [call] = reviewCalls(calls);
+  return call ? JSON.parse(call.options.body) : null;
+}
+
+function reactionContents(calls) {
+  return calls
+    .filter((call) => call.url.endsWith("/issues/12/reactions") && call.options.method === "POST")
+    .map((call) => JSON.parse(call.options.body).content);
 }
 
 // ---------------------------------------------------------------------------
@@ -401,21 +435,62 @@ test("buildScopeLine reports coverage honestly", () => {
   );
 });
 
-test("buildMainComment includes pass/fail heading, scope, findings, and tags", () => {
+test("parseFinding splits protocol-formatted lines and keeps unknown lines raw", () => {
+  assert.deepEqual(
+    parseFinding("🔴 🛡️ **Retry storm** — src/a.js:12 — retries without backoff — add jitter"),
+    {
+      raw: "🔴 🛡️ **Retry storm** — src/a.js:12 — retries without backoff — add jitter",
+      severity: "🔴",
+      category: "🛡",
+      title: "Retry storm",
+      location: "src/a.js:12",
+      details: "retries without backoff — add jitter",
+    },
+  );
+  const noLocation = parseFinding("🟡 🧹 **Naming** — hides the unit");
+  assert.equal(noLocation.location, null);
+  assert.equal(noLocation.details, "hides the unit");
+  const raw = parseFinding("Something odd");
+  assert.equal(raw.severity, null);
+  assert.equal(raw.title, "Something odd");
+});
+
+test("buildCategoryTable summarises findings per category", () => {
+  const table = buildCategoryTable([
+    parseFinding("🔴 🐛 **A** — a.js:1 — x"),
+    parseFinding("🟡 🐛 **B** — a.js:2 — y"),
+    parseFinding("🟡 🧪 **C** — t.js:1 — z"),
+  ]);
+  assert.match(table, /\| 🐛 Correctness \| ❌ 1 blocking, 1 follow-up \|/);
+  assert.match(table, /\| 🧪 Tests \| ⚠️ 1 issue \|/);
+  assert.match(table, /\| 🔒 Security \| ✅ Clean \|/);
+  assert.match(table, /\| 🛡️ Reliability \| ✅ Clean \|/);
+});
+
+test("buildMainComment renders heading, scope, category table, collapsible findings, links, and tags", () => {
   const passedComment = buildMainComment({ summary: "ok", findings: [], passed: true });
+  assert.match(passedComment, /^## ✅ AI Review Passed/);
+  assert.match(passedComment, /No actionable issues found/);
+  assert.doesNotMatch(passedComment, /<details>/);
+
   const failedComment = buildMainComment({
     summary: "needs fixes",
-    findings: ["A"],
+    findings: ["🔴 🔒 **Token <leak>** — src/a.js:12 — the token is logged; redact it", "plain line"],
     passed: false,
     scope: "Reviewed: 2 files",
     tags: ["security"],
+    owner: "owner",
+    repo: "repo",
+    headSha: "abc123",
   });
-
-  assert.match(passedComment, /AI Review Passed/);
-  assert.match(passedComment, /No actionable issues found/);
-  assert.match(failedComment, /AI Review Needs Attention/);
+  assert.match(failedComment, /^## ❌ AI Review Needs Attention/);
   assert.match(failedComment, /_Reviewed: 2 files_/);
-  assert.match(failedComment, /- A/);
+  assert.match(failedComment, /\| 🔒 Security \| ❌ 1 blocking \|/);
+  assert.match(failedComment, /\| ❔ Uncategorized \| ⚠️ 1 issue \|/);
+  assert.match(failedComment, /\*\*Findings \(2\)\*\*/);
+  assert.match(failedComment, /<summary>🔴 🔒 <b>Token &lt;leak&gt;<\/b> — <a href="https:\/\/github.com\/owner\/repo\/blob\/abc123\/src\/a.js#L12"><code>src\/a.js:12<\/code><\/a><\/summary>/);
+  assert.match(failedComment, /\n\nthe token is logged; redact it\n\n<\/details>/);
+  assert.match(failedComment, /- plain line/);
   assert.match(failedComment, /Tags: `security`/);
 });
 
@@ -465,22 +540,29 @@ test("single-chunk PR uses the chunk result directly and makes exactly one AI ca
     assert.equal(requestBody.temperature, 0);
     assert.match(requestBody.prompt, /complete reviewable diff/);
 
-    const reviewCall = calls.find((call) => call.url.includes("/pulls/12/reviews"));
-    const reviewBody = JSON.parse(reviewCall.options.body);
-    assert.deepEqual(reviewBody.comments, [{ path: "a.js", line: 1, side: "RIGHT", body: "🔴 🔒 Use better value" }]);
+    assert.equal(reviewCalls(calls).length, 1, "one PR review carries body and inline comments");
+    const reviewBody = postedReviewBody(calls);
+    assert.equal(reviewBody.event, "COMMENT");
+    assert.deepEqual(reviewBody.comments, [
+      { path: "a.js", line: 1, side: "RIGHT", body: "🔴 🔒 Use better value\n\n<!-- review-my-code:inline -->" },
+    ]);
+    assert.match(reviewBody.body, /^## ❌ AI Review Needs Attention/);
+    assert.match(reviewBody.body, /Reviewed: 1 file/);
+    assert.match(reviewBody.body, /\| 🔒 Security \| ❌ 1 blocking \|/);
+    assert.match(reviewBody.body, /<summary>🔴 🔒 <b>Bad<\/b>/);
+    assert.match(reviewBody.body, /Tags: `security`/);
+    assert.match(reviewBody.body, /<!-- review-my-code:main -->$/);
+    assert.match(reviewBody.comments[0].body, /<!-- review-my-code:inline -->$/);
+    assert.equal(calls.some((call) => call.url.includes("/issues/12/comments")), false, "no separate issue comment");
+    assert.equal(result.updatedExistingReview, false);
 
-    const commentCall = calls.find((call) => call.url.includes("/issues/12/comments"));
-    const commentBody = JSON.parse(commentCall.options.body).body;
-    assert.match(commentBody, /Reviewed: 1 file/);
-    assert.match(commentBody, /Tags: `security`/);
+    assert.deepEqual(reactionContents(calls), ["eyes", "-1"], "👀 while reviewing, 👎 when done, on the PR itself");
 
     const labelsCall = calls.find((call) => call.url.endsWith("/issues/12/labels") && call.options.method === "POST");
     assert.deepEqual(JSON.parse(labelsCall.options.body).labels, ["ai-reviewed", "ai-review:needs-fixes"]);
     const removeCall = calls.find((call) => call.options.method === "DELETE");
     assert.match(removeCall.url, /labels\/ai-review%3Apassed$/);
 
-    const reactionCall = calls.find((call) => call.url.includes("/reactions"));
-    assert.equal(JSON.parse(reactionCall.options.body).content, "-1");
   } finally {
     restore();
   }
@@ -532,11 +614,12 @@ test("multi-chunk PR runs the adjudicator and honours AI_CONCURRENCY", async () 
     assert.equal(aiCalls.length, 4);
     const finalPrompt = JSON.parse(aiCalls[3].options.body).prompt;
     assert.match(finalPrompt, /split into 3 chunks and 3 of them were reviewed/);
-    const commentBody = JSON.parse(calls.find((call) => call.url.includes("/issues/12/comments")).options.body).body;
-    assert.match(commentBody, /- merged finding/);
-    assert.match(commentBody, /Reviewed: 3 files in 3 chunks/);
-    const reviewBody = JSON.parse(calls.find((call) => call.url.includes("/pulls/12/reviews")).options.body);
-    assert.deepEqual(reviewBody.comments, [{ path: "a.js", line: 1, side: "RIGHT", body: "🟡 🐛 reconciled" }]);
+    const reviewBody = postedReviewBody(calls);
+    assert.match(reviewBody.body, /- merged finding/);
+    assert.match(reviewBody.body, /Reviewed: 3 files in 3 chunks/);
+    assert.deepEqual(reviewBody.comments, [
+      { path: "a.js", line: 1, side: "RIGHT", body: "🟡 🐛 reconciled\n\n<!-- review-my-code:inline -->" },
+    ]);
   } finally {
     restore();
   }
@@ -560,8 +643,7 @@ test("chunk budget caps AI calls and reports unreviewed chunks in scope", async 
     assert.equal(result.chunkCount, 2);
     assert.equal(result.unreviewedChunks, 1);
     assert.equal(calls.filter((call) => call.url === "https://ai.example/review").length, 3);
-    const commentBody = JSON.parse(calls.find((call) => call.url.includes("/issues/12/comments")).options.body).body;
-    assert.match(commentBody, /1 chunk not reviewed: diff exceeds the review budget/);
+    assert.match(postedReviewBody(calls).body, /1 chunk not reviewed: diff exceeds the review budget/);
   } finally {
     restore();
   }
@@ -588,8 +670,7 @@ test("a failed chunk is reported in scope and does not fail the whole review", a
 
     assert.equal(result.failedChunks, 1);
     assert.equal(result.passed, true);
-    const commentBody = JSON.parse(calls.find((call) => call.url.includes("/issues/12/comments")).options.body).body;
-    assert.match(commentBody, /1 chunk not reviewed: AI request failed/);
+    assert.match(postedReviewBody(calls).body, /1 chunk not reviewed: AI request failed/);
   } finally {
     restore();
   }
@@ -603,7 +684,8 @@ test("all chunks failing throws a retriable error and posts nothing", async () =
       assert.equal(isRetriableError(error), true);
       return true;
     });
-    assert.equal(calls.some((call) => call.url.includes("/issues/12/comments")), false);
+    assert.equal(reviewCalls(calls).length, 0);
+    assert.deepEqual(reactionContents(calls), ["eyes", "confused"]);
   } finally {
     restore();
   }
@@ -661,7 +743,8 @@ test("lockfile-only PR makes no AI call and posts nothing", async () => {
       ignoredPaths: ["package-lock.json", "node_modules/x/i.js"],
     });
     assert.equal(calls.filter((call) => call.url === "https://ai.example/review").length, 0);
-    assert.equal(calls.some((call) => call.url.includes("/issues/12/comments")), false);
+    assert.equal(reviewCalls(calls).length, 0);
+    assert.deepEqual(reactionContents(calls), [], "no reaction when there is nothing to review");
   } finally {
     restore();
   }
@@ -705,6 +788,113 @@ test("REVIEW_STATE marker skips already reviewed heads and is written after post
   }
 });
 
+test("old bot reactions on the PR are removed before the new one is added", async () => {
+  const { calls, restore } = mockFetch({
+    reactions: [
+      { id: 1, content: "-1", user: { login: "review-bot" } },
+      { id: 2, content: "+1", user: { login: "someone-else" } },
+      { id: 3, content: "heart", user: { login: "review-bot" } },
+    ],
+  });
+  try {
+    await processPullRequestReview(BASE_ENV, BASE_PAYLOAD);
+    const deletes = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/reactions/"));
+    assert.deepEqual([...new Set(deletes.map((call) => call.url.split("/").pop()))], ["1"], "only the bot's own review reaction is removed");
+    assert.deepEqual(reactionContents(calls), ["eyes", "+1"]);
+  } finally {
+    restore();
+  }
+});
+
+test("a later run updates the existing bot review in place and replaces inline comments", async () => {
+  const { calls, restore } = mockFetch({
+    existingReviews: [
+      { id: 41, user: { login: "someone-else" }, body: "LGTM <!-- review-my-code:main -->" },
+      { id: 42, user: { login: "review-bot" }, body: "## ❌ AI Review Needs Attention\n<!-- review-my-code:main -->" },
+      { id: 43, user: { login: "review-bot" }, body: "Inline comments refreshed for `abc`." },
+    ],
+    existingInline: [
+      { id: 7, user: { login: "review-bot" }, body: "old 🔴 <!-- review-my-code:inline -->" },
+      { id: 8, user: { login: "review-bot" }, body: "a human-looking reply without marker" },
+      { id: 9, user: { login: "someone-else" }, body: "mine <!-- review-my-code:inline -->" },
+    ],
+    ai: () => ({
+      passed: true,
+      summary: "✅ Mergeable",
+      tags: [],
+      findings: ["🟡 🧹 **Nit** — a.js:1 — meh"],
+      inlineComments: [{ path: "a.js", line: 1, body: "🟡 🧹 meh" }],
+    }),
+  });
+  try {
+    const result = await processReviewJob(BASE_ENV, { owner: "owner", repo: "repo", pullNumber: 12, headSha: "abcdef0123" });
+    assert.equal(result.updatedExistingReview, true);
+
+    const put = calls.find((call) => call.options.method === "PUT");
+    assert.match(put.url, /\/pulls\/12\/reviews\/42$/);
+    assert.match(JSON.parse(put.options.body).body, /^## ✅ AI Review Passed/);
+
+    const deleted = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/pulls/comments/"));
+    assert.deepEqual(deleted.map((call) => call.url.split("/").pop()), ["7"], "only the bot's marked inline comments are deleted");
+
+    const created = reviewCalls(calls);
+    assert.equal(created.length, 1, "only the inline follow-up review is created");
+    const followUp = JSON.parse(created[0].options.body);
+    assert.match(followUp.body, /Inline comments refreshed for `abcdef0`/);
+    assert.equal(followUp.comments.length, 1);
+    assert.equal(followUp.commit_id, "abcdef0123");
+  } finally {
+    restore();
+  }
+});
+
+test("a later run with no inline comments only updates the review body", async () => {
+  const { calls, restore } = mockFetch({
+    existingReviews: [{ id: 42, user: { login: "review-bot" }, body: "x <!-- review-my-code:main -->" }],
+  });
+  try {
+    await processPullRequestReview(BASE_ENV, BASE_PAYLOAD);
+    assert.equal(calls.filter((call) => call.options.method === "PUT").length, 1);
+    assert.equal(reviewCalls(calls).length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("inline comments rejected by GitHub fall back to a body-only review", async () => {
+  let reviewPosts = 0;
+  const originalFetch = global.fetch;
+  const { calls, restore } = mockFetch({
+    ai: () => ({
+      passed: true,
+      summary: "ok",
+      tags: [],
+      findings: ["🟡 🧹 **Nit** — a.js:1 — meh"],
+      inlineComments: [{ path: "a.js", line: 1, body: "🟡 🧹 meh" }],
+    }),
+  });
+  const mocked = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    if (url.includes("/pulls/12/reviews") && options.method === "POST") {
+      reviewPosts += 1;
+      calls.push({ url, options });
+      return reviewPosts === 1 ? new Response("Unprocessable", { status: 422 }) : Response.json({ id: 1 });
+    }
+    return mocked(url, options);
+  };
+  try {
+    const result = await processPullRequestReview(BASE_ENV, BASE_PAYLOAD);
+    assert.equal(reviewPosts, 2);
+    assert.equal(result.inlineCommentsCount, 0);
+    const second = JSON.parse(reviewCalls(calls)[1].options.body);
+    assert.deepEqual(second.comments, []);
+    assert.match(second.body, /Nit/);
+  } finally {
+    restore();
+    global.fetch = originalFetch;
+  }
+});
+
 test("processPullRequestReview filters non-reviewable inline comment lines", async () => {
   const { calls, restore } = mockFetch({
     ai: () => ({
@@ -718,7 +908,9 @@ test("processPullRequestReview filters non-reviewable inline comment lines", asy
 
   try {
     await processPullRequestReview(BASE_ENV, BASE_PAYLOAD);
-    assert.equal(calls.find((call) => call.url.includes("/pulls/12/reviews")), undefined);
+    const reviewBody = postedReviewBody(calls);
+    assert.deepEqual(reviewBody.comments, [], "review is still posted, without the invalid inline comment");
+    assert.match(reviewBody.body, /Fix issue/);
   } finally {
     restore();
   }
@@ -839,7 +1031,7 @@ test("worker falls back to inline processing via waitUntil without a queue bindi
     assert.equal((await response.json()).inline, true);
     assert.equal(background.length, 1);
     await Promise.all(background);
-    assert.ok(calls.some((call) => call.url.includes("/issues/12/comments")));
+    assert.equal(reviewCalls(calls).length, 1);
   } finally {
     restore();
   }

@@ -310,6 +310,86 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
+const BOT_REACTIONS = ["eyes", "+1", "-1", "confused"];
+// Hidden markers let later runs find and refresh this bot's own review and inline comments.
+const MAIN_MARKER = "<!-- review-my-code:main -->";
+const INLINE_MARKER = "<!-- review-my-code:inline -->";
+
+async function getBotLogin(env) {
+  try {
+    const response = await githubApiRequest(env, "/user", { nonFatalStatuses: [403, 404] });
+    if (!response.ok) {
+      return null;
+    }
+    const user = await response.json();
+    return user?.login ?? null;
+  } catch (error) {
+    log("error", "Could not resolve bot login", { error: error.message });
+    return null;
+  }
+}
+
+async function findMainReview(env, job, login) {
+  if (!login) {
+    return null;
+  }
+  const { owner, repo, pullNumber } = job;
+  const response = await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews?per_page=100`);
+  const reviews = await response.json();
+  const mine = (Array.isArray(reviews) ? reviews : []).filter(
+    (review) => review?.user?.login === login && typeof review.body === "string" && review.body.includes(MAIN_MARKER),
+  );
+  return mine.length ? mine[mine.length - 1] : null;
+}
+
+async function deleteBotInlineComments(env, job, login) {
+  if (!login) {
+    return 0;
+  }
+  const { owner, repo, pullNumber } = job;
+  const response = await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/comments?per_page=100`);
+  const comments = await response.json();
+  let deleted = 0;
+  for (const comment of Array.isArray(comments) ? comments : []) {
+    if (comment?.user?.login === login && typeof comment.body === "string" && comment.body.includes(INLINE_MARKER)) {
+      await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/comments/${comment.id}`, {
+        method: "DELETE",
+        nonFatalStatuses: [403, 404],
+      });
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
+/**
+ * Replaces the bot's own reaction on the pull request itself: 👀 while a review
+ * is running, 👍/👎 when it is done, 😕 when it failed. Reactions are cosmetic,
+ * so permission problems are logged and never fail the review.
+ */
+async function setPullRequestReaction(env, job, content, login) {
+  const { owner, repo, pullNumber } = job;
+  const base = `/repos/${owner}/${repo}/issues/${pullNumber}/reactions`;
+  try {
+    const listResponse = await githubApiRequest(env, `${base}?per_page=100`, { nonFatalStatuses: [403, 404] });
+    const existing = listResponse.ok ? await listResponse.json() : [];
+    for (const reaction of Array.isArray(existing) ? existing : []) {
+      if (reaction?.user?.login === login && BOT_REACTIONS.includes(reaction.content) && reaction.content !== content) {
+        await githubApiRequest(env, `${base}/${reaction.id}`, { method: "DELETE", nonFatalStatuses: [403, 404] });
+      }
+    }
+    if (!existing.some?.((reaction) => reaction?.user?.login === login && reaction.content === content)) {
+      await githubApiRequest(env, base, {
+        method: "POST",
+        nonFatalStatuses: [403, 404, 422],
+        body: JSON.stringify({ content }),
+      });
+    }
+  } catch (error) {
+    log("error", "Failed to update PR reaction", { owner, repo, pullNumber, content, error: error.message });
+  }
+}
+
 async function isHeadStale(env, job) {
   if (!job.headSha) {
     return false;
@@ -347,6 +427,20 @@ export async function processReviewJob(env, job) {
     log("info", "Nothing to review after filtering", { ...logFields, ignored: filtered.ignoredPaths.length });
     return { skipped: true, reason: "nothing-to-review", ignoredPaths: filtered.ignoredPaths };
   }
+
+  const login = await getBotLogin(env);
+  await setPullRequestReaction(env, job, "eyes", login);
+  try {
+    return await runReview(env, job, settings, filtered, reviewedKey, login);
+  } catch (error) {
+    await setPullRequestReaction(env, job, "confused", login);
+    throw error;
+  }
+}
+
+async function runReview(env, job, settings, filtered, reviewedKey, login) {
+  const { owner, repo, pullNumber } = job;
+  const logFields = { owner, repo, pullNumber, headSha: job.headSha };
 
   const allChunks = splitDiffIntoChunks(filtered.diff, settings.maxChunkChars);
   const chunks = allChunks.slice(0, settings.maxChunks);
@@ -421,31 +515,66 @@ export async function processReviewJob(env, job) {
     unreviewedChunks,
   });
 
-  if (reviewComments.length > 0) {
-    await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`, {
+  const body = buildMainComment({
+    summary: decision.summary,
+    findings,
+    passed,
+    scope,
+    tags,
+    owner,
+    repo,
+    headSha: job.headSha,
+  });
+  const mainBody = `${body}\n\n${MAIN_MARKER}`;
+  const inline = reviewComments.map((comment) => ({ ...comment, body: `${comment.body}\n\n${INLINE_MARKER}` }));
+  const commitFields = job.headSha ? { commit_id: job.headSha } : {};
+  const reviewsPath = `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`;
+
+  // One review per PR: later runs update its body in place and replace the inline
+  // comments. GitHub cannot attach new inline comments to a submitted review, so
+  // refreshed inline comments ride on a short follow-up review.
+  const existingReview = await findMainReview(env, job, login);
+  const deletedInline = await deleteBotInlineComments(env, job, login);
+
+  async function createReview(reviewBody, comments) {
+    const response = await githubApiRequest(env, reviewsPath, {
       method: "POST",
-      body: JSON.stringify({
-        ...(job.headSha ? { commit_id: job.headSha } : {}),
-        body: "Inline AI review comments.",
-        event: "COMMENT",
-        comments: reviewComments,
-      }),
+      nonFatalStatuses: comments.length ? [422] : [],
+      body: JSON.stringify({ ...commitFields, body: reviewBody, event: "COMMENT", comments }),
     });
+    if (response.ok) {
+      return comments.length;
+    }
+    log("error", "Inline comments rejected, posting review body only", {
+      ...logFields,
+      status: response.status,
+      detail: (await response.text()).slice(0, 300),
+    });
+    await githubApiRequest(env, reviewsPath, {
+      method: "POST",
+      body: JSON.stringify({ ...commitFields, body: reviewBody, event: "COMMENT", comments: [] }),
+    });
+    return 0;
   }
 
-  const commentResponse = await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/comments`, {
-    method: "POST",
-    body: JSON.stringify({
-      body: buildMainComment({ summary: decision.summary, findings, passed, scope, tags }),
-    }),
-  });
-  const mainComment = await commentResponse.json();
+  let postedInline = 0;
+  if (existingReview) {
+    await githubApiRequest(env, `${reviewsPath}/${existingReview.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ body: mainBody }),
+    });
+    if (inline.length) {
+      const shortSha = job.headSha ? job.headSha.slice(0, 7) : "latest";
+      postedInline = await createReview(
+        `Inline comments refreshed for \`${shortSha}\`. The summary is in the review above.`,
+        inline,
+      );
+    }
+  } else {
+    postedInline = await createReview(mainBody, inline);
+  }
 
-  await githubApiRequest(env, `/repos/${owner}/${repo}/issues/comments/${mainComment.id}/reactions`, {
-    method: "POST",
-    nonFatalStatuses: [403, 404, 422],
-    body: JSON.stringify({ content: passed ? "+1" : "-1" }),
-  });
+  await setPullRequestReaction(env, job, passed ? "+1" : "-1", login);
 
   // Only well-known labels are applied; AI-provided tags stay in the comment so a
   // typo from the model can never create or fail on arbitrary repository labels.
@@ -470,7 +599,9 @@ export async function processReviewJob(env, job) {
     chunks: chunks.length,
     failedChunks,
     unreviewedChunks,
-    inlineComments: reviewComments.length,
+    inlineComments: postedInline,
+    deletedInline,
+    updatedExistingReview: Boolean(existingReview),
     aiCalls: chunks.length + (chunkResults.length > 1 ? 1 : 0),
   });
 
@@ -480,7 +611,8 @@ export async function processReviewJob(env, job) {
     chunkCount: chunks.length,
     failedChunks,
     unreviewedChunks,
-    inlineCommentsCount: reviewComments.length,
+    inlineCommentsCount: postedInline,
+    updatedExistingReview: Boolean(existingReview),
     tagCount: tags.length,
   };
 }
