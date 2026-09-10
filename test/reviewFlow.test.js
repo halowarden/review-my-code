@@ -4,11 +4,13 @@ import {
   buildAIRequestBody,
   buildCategoryTable,
   buildMainComment,
+  buildMetricsBlock,
   buildScopeLine,
   createChunkPrompt,
   createFinalDecisionPrompt,
   dedupeInlineComments,
   extractAIOutput,
+  extractAIUsage,
   filterDiff,
   parseAIParams,
   parseAIResponse,
@@ -409,7 +411,10 @@ test("default (openai) format end-to-end posts to chat/completions and parses th
     ai: (prompt, request) => {
       assert.ok(Array.isArray(request.messages));
       assert.equal(request.response_format.type, "json_object");
-      return { choices: [{ message: { content: '{"passed":true,"summary":"✅ Mergeable","tags":[],"findings":[],"inlineComments":[]}' } }] };
+      return {
+        choices: [{ message: { content: '{"passed":true,"summary":"✅ Mergeable","tags":[],"findings":[],"inlineComments":[]}' } }],
+        usage: { prompt_tokens: 1234, completion_tokens: 56 },
+      };
     },
   });
   try {
@@ -423,6 +428,10 @@ test("default (openai) format end-to-end posts to chat/completions and parses th
     );
     assert.equal(result.passed, true);
     assert.ok(calls.some((call) => call.url === "https://ai.example/review/chat/completions"));
+    const body = postedReviewBody(calls).body;
+    assert.match(body, /📊 Review metrics/);
+    assert.match(body, /\| Tokens \| 1,234 in \/ 56 out \|/);
+    assert.match(body, /\| AI calls \| 1 \(1 chunk\) \|/);
   } finally {
     restore();
   }
@@ -495,6 +504,46 @@ test("multi-chunk review keeps chunk inline comments when the adjudicator omits 
   } finally {
     restore();
   }
+});
+
+test("extractAIUsage reads OpenAI and Anthropic style usage", () => {
+  assert.deepEqual(extractAIUsage({ usage: { prompt_tokens: 10, completion_tokens: 3 } }), { promptTokens: 10, completionTokens: 3 });
+  assert.deepEqual(extractAIUsage({ usage: { input_tokens: 7, output_tokens: 1 } }), { promptTokens: 7, completionTokens: 1 });
+  assert.equal(extractAIUsage({}), null);
+  assert.equal(extractAIUsage({ usage: {} }), null);
+});
+
+test("buildMetricsBlock renders a collapsed table with tokens, time, cost, and diff size", () => {
+  const block = buildMetricsBlock({
+    model: "qwen3.8-max",
+    calls: [
+      { kind: "chunk", usage: { promptTokens: 20000, completionTokens: 1000 }, durationMs: 12000 },
+      { kind: "chunk", failed: true },
+      { kind: "final", usage: { promptTokens: 3000, completionTokens: 500 }, durationMs: 4000 },
+    ],
+    totalMs: 20500,
+    queueWaitMs: 800,
+    diffChars: 98412,
+    reviewedFiles: 9,
+    totalChunks: 2,
+    headSha: "abcdef0123",
+    priceInPerMTok: 1,
+    priceOutPerMTok: 4,
+  });
+  assert.match(block, /^<details>\n<summary>📊 Review metrics<\/summary>/);
+  assert.match(block, /\| Model \| `qwen3.8-max` \|/);
+  assert.match(block, /\| AI calls \| 3 \(2 chunks \+ 1 adjudication \+ 1 failed\) \|/);
+  assert.match(block, /\| Tokens \| 23,000 in \/ 1,500 out \|/);
+  assert.match(block, /\| Estimated cost \| \$0\.0290 \|/);
+  assert.match(block, /\| AI time \| 16\.0 s \|/);
+  assert.match(block, /\| Total time \| 20\.5 s \(queue wait 0\.8 s\) \|/);
+  assert.match(block, /\| Diff \| 9 files, 98,412 chars in 2 chunks \|/);
+  assert.match(block, /\| Commit \| `abcdef0` \|/);
+
+  const noUsage = buildMetricsBlock({ calls: [{ kind: "chunk", durationMs: 5 }], totalMs: 10 });
+  assert.match(noUsage, /not reported by the provider/);
+  assert.doesNotMatch(noUsage, /Estimated cost/);
+  assert.equal(buildMetricsBlock(null), "");
 });
 
 test("buildCategoryTable summarises findings per category", () => {
@@ -720,8 +769,11 @@ test("a failed chunk is reported in scope and does not fail the whole review", a
   }
 });
 
-test("all chunks failing throws a retriable error and posts nothing", async () => {
-  const { calls, restore } = mockFetch({ ai: () => new Response("down", { status: 503 }) });
+test("all chunks failing throws a retriable error, posts nothing new, and marks the existing review failed", async () => {
+  const { calls, restore } = mockFetch({
+    ai: () => new Response("down", { status: 503 }),
+    existingReviews: [{ id: 42, user: { login: "review-bot" }, body: "x <!-- review-my-code:main -->" }],
+  });
 
   try {
     await assert.rejects(processPullRequestReview(BASE_ENV, BASE_PAYLOAD), (error) => {
@@ -730,6 +782,8 @@ test("all chunks failing throws a retriable error and posts nothing", async () =
     });
     assert.equal(reviewCalls(calls).length, 0);
     assert.deepEqual(reactionContents(calls), ["eyes", "confused"]);
+    const puts = calls.filter((call) => call.options.method === "PUT");
+    assert.match(JSON.parse(puts[puts.length - 1].options.body).body, /^## 😕 AI Review failed[\s\S]*retried automatically/);
   } finally {
     restore();
   }
@@ -788,7 +842,22 @@ test("lockfile-only PR makes no AI call and posts nothing", async () => {
     });
     assert.equal(calls.filter((call) => call.url === "https://ai.example/review").length, 0);
     assert.equal(reviewCalls(calls).length, 0);
-    assert.deepEqual(reactionContents(calls), [], "no reaction when there is nothing to review");
+    assert.deepEqual(reactionContents(calls), [], "no verdict reaction when there is nothing to review");
+  } finally {
+    restore();
+  }
+});
+
+test("nothing-to-review removes the 👀 set by the webhook", async () => {
+  const { calls, restore } = mockFetch({
+    diff: fileDiff("package-lock.json", 5),
+    reactions: [{ id: 5, content: "eyes", user: { login: "review-bot" } }],
+  });
+  try {
+    await processPullRequestReview(BASE_ENV, BASE_PAYLOAD);
+    const deletes = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/reactions/"));
+    assert.deepEqual(deletes.map((call) => call.url.split("/").pop()), ["5"]);
+    assert.deepEqual(reactionContents(calls), []);
   } finally {
     restore();
   }
@@ -801,7 +870,7 @@ test("stale head SHA skips the review before fetching the diff", async () => {
     const result = await processReviewJob(BASE_ENV, { owner: "owner", repo: "repo", pullNumber: 12, headSha: "older" });
 
     assert.deepEqual(result, { skipped: true, reason: "stale-head" });
-    assert.equal(calls.length, 1);
+    assert.deepEqual(calls.map((call) => call.url.split("api.github.com")[1]), ["/user", "/repos/owner/repo/pulls/12"]);
   } finally {
     restore();
   }
@@ -810,7 +879,7 @@ test("stale head SHA skips the review before fetching the diff", async () => {
 test("REVIEW_STATE marker skips already reviewed heads and is written after posting", async () => {
   const store = new Map();
   const kv = {
-    get: async (key) => store.get(key) ?? null,
+    get: async (key) => store.get(key)?.value ?? null,
     put: async (key, value, options) => store.set(key, { value, options }),
   };
   const { calls, restore } = mockFetch({ pullJson: { head: { sha: "abc" } } });
@@ -820,13 +889,18 @@ test("REVIEW_STATE marker skips already reviewed heads and is written after post
     const first = await processReviewJob({ ...BASE_ENV, REVIEW_STATE: kv }, job);
     assert.equal(first.skipped, false);
     const marker = store.get("reviewed:owner/repo/12/abc");
-    assert.ok(marker);
+    assert.equal(marker.value, "+1", "the marker stores the verdict reaction");
     assert.equal(marker.options.expirationTtl, 30 * 24 * 60 * 60);
 
     const aiCallsBefore = calls.filter((call) => call.url === "https://ai.example/review").length;
+    const reactionsBefore = reactionContents(calls).length;
+    const labelPostsBefore = calls.filter((call) => call.url.endsWith("/labels") && call.options.method === "POST").length;
     const second = await processReviewJob({ ...BASE_ENV, REVIEW_STATE: kv }, job);
     assert.deepEqual(second, { skipped: true, reason: "already-reviewed" });
     assert.equal(calls.filter((call) => call.url === "https://ai.example/review").length, aiCallsBefore);
+    assert.deepEqual(reactionContents(calls).slice(reactionsBefore), ["+1"], "👀 from the webhook is turned back into the stored verdict");
+    const labelPosts = calls.filter((call) => call.url.endsWith("/labels") && call.options.method === "POST");
+    assert.deepEqual(JSON.parse(labelPosts[labelPostsBefore].options.body).labels, ["ai-reviewed", "ai-review:passed"], "labels restored too");
   } finally {
     restore();
   }
@@ -874,9 +948,14 @@ test("a later run updates the existing bot review in place and replaces inline c
     const result = await processReviewJob(BASE_ENV, { owner: "owner", repo: "repo", pullNumber: 12, headSha: "abcdef0123" });
     assert.equal(result.updatedExistingReview, true);
 
-    const put = calls.find((call) => call.options.method === "PUT");
-    assert.match(put.url, /\/pulls\/12\/reviews\/42$/);
-    assert.match(JSON.parse(put.options.body).body, /^## ✅ AI Review Passed/);
+    const puts = calls.filter((call) => call.options.method === "PUT");
+    assert.equal(puts.length, 2, "in-progress body first, final body second");
+    assert.ok(puts.every((call) => /\/pulls\/12\/reviews\/42$/.test(call.url)));
+    assert.match(JSON.parse(puts[0].options.body).body, /^## ⏳ AI Review in progress[\s\S]*abcdef0[\s\S]*review-my-code:main/);
+    assert.match(JSON.parse(puts[1].options.body).body, /^## ✅ AI Review Passed/);
+    const firstPutIndex = calls.indexOf(puts[0]);
+    const firstAiIndex = calls.findIndex((call) => call.url.startsWith("https://ai.example/"));
+    assert.ok(firstPutIndex < firstAiIndex, "the review is marked in progress before the AI is called");
 
     const deleted = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/pulls/comments/"));
     assert.deepEqual(deleted.map((call) => call.url.split("/").pop()), ["7"], "only the bot's marked inline comments are deleted");
@@ -898,7 +977,7 @@ test("a later run with no inline comments only updates the review body", async (
   });
   try {
     await processPullRequestReview(BASE_ENV, BASE_PAYLOAD);
-    assert.equal(calls.filter((call) => call.options.method === "PUT").length, 1);
+    assert.equal(calls.filter((call) => call.options.method === "PUT").length, 2, "in-progress, then final");
     assert.equal(reviewCalls(calls).length, 0);
   } finally {
     restore();
@@ -1041,8 +1120,21 @@ test("worker enqueues a signed pull_request delivery and answers 202 immediately
 
     assert.equal(response.status, 202);
     assert.equal((await response.json()).queued, true);
+    assert.equal(sent.length, 1);
+    assert.ok(Number.isFinite(sent[0].enqueuedAt), "the job records when it was enqueued for queue-wait metrics");
+    delete sent[0].enqueuedAt;
     assert.deepEqual(sent, [{ owner: "owner", repo: "repo", pullNumber: 12, headSha: "abc", action: "opened" }]);
-    assert.equal(calls.length, 0, "the webhook handler itself never calls GitHub or the AI");
+    assert.deepEqual(reactionContents(calls), ["eyes"], "👀 is set as soon as the delivery is accepted");
+    const labelDeletes = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/labels/"));
+    assert.deepEqual(
+      labelDeletes.map((call) => decodeURIComponent(call.url.split("/labels/")[1])).sort(),
+      ["ai-review:needs-fixes", "ai-review:passed"],
+      "stale verdict labels are removed immediately",
+    );
+    assert.ok(
+      calls.every((call) => call.url.endsWith("/user") || call.url.includes("/reactions") || call.url.includes("/labels/")),
+      "the webhook handler touches nothing but reactions and labels",
+    );
   } finally {
     restore();
   }
@@ -1073,7 +1165,7 @@ test("worker falls back to inline processing via waitUntil without a queue bindi
 
     assert.equal(response.status, 202);
     assert.equal((await response.json()).inline, true);
-    assert.equal(background.length, 1);
+    assert.equal(background.length, 2, "👀 acknowledgement and the review itself both run via waitUntil");
     await Promise.all(background);
     assert.equal(reviewCalls(calls).length, 1);
   } finally {

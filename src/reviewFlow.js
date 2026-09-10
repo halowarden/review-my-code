@@ -440,6 +440,23 @@ export function resolveAIRequestUrl(env) {
   return url;
 }
 
+/** Token usage as reported by the provider, when present. */
+export function extractAIUsage(payload) {
+  const usage = payload?.usage;
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens);
+  const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens);
+  if (!Number.isFinite(promptTokens) && !Number.isFinite(completionTokens)) {
+    return null;
+  }
+  return {
+    promptTokens: Number.isFinite(promptTokens) ? promptTokens : 0,
+    completionTokens: Number.isFinite(completionTokens) ? completionTokens : 0,
+  };
+}
+
 /** Unwraps the provider envelope into the review JSON (string or object). */
 export function extractAIOutput(payload, format = DEFAULT_AI_API_FORMAT) {
   if (format === "openai") {
@@ -707,7 +724,71 @@ export function buildCategoryTable(parsedFindings) {
   return ["| Category | Status |", "|---|---|", ...rows].join("\n");
 }
 
-export function buildMainComment({ summary, findings, passed, scope, tags = [], owner, repo, headSha }) {
+function formatNumber(value) {
+  return Number(value).toLocaleString("en-US");
+}
+
+function formatSeconds(ms) {
+  if (!Number.isFinite(ms)) {
+    return "n/a";
+  }
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+/**
+ * Collapsed metrics block: what the review cost in time and tokens. Prices per
+ * million tokens are optional (AI_PRICE_IN_PER_MTOK / AI_PRICE_OUT_PER_MTOK).
+ */
+export function buildMetricsBlock(metrics) {
+  if (!metrics) {
+    return "";
+  }
+  const calls = metrics.calls ?? [];
+  const promptTokens = calls.reduce((sum, call) => sum + (call.usage?.promptTokens ?? 0), 0);
+  const completionTokens = calls.reduce((sum, call) => sum + (call.usage?.completionTokens ?? 0), 0);
+  const hasUsage = calls.some((call) => call.usage);
+  const aiMs = calls.reduce((sum, call) => sum + (call.durationMs ?? 0), 0);
+  const chunkCalls = calls.filter((call) => call.kind === "chunk").length;
+  const finalCalls = calls.filter((call) => call.kind === "final").length;
+  const failedCalls = calls.filter((call) => call.failed).length;
+
+  const rows = [];
+  if (metrics.model) {
+    rows.push(["Model", `\`${metrics.model}\``]);
+  }
+  const breakdown = [`${chunkCalls} chunk${chunkCalls === 1 ? "" : "s"}`];
+  if (finalCalls) {
+    breakdown.push(`${finalCalls} adjudication`);
+  }
+  if (failedCalls) {
+    breakdown.push(`${failedCalls} failed`);
+  }
+  rows.push(["AI calls", `${calls.length} (${breakdown.join(" + ")})`]);
+  rows.push([
+    "Tokens",
+    hasUsage ? `${formatNumber(promptTokens)} in / ${formatNumber(completionTokens)} out` : "not reported by the provider",
+  ]);
+  if (hasUsage && (metrics.priceInPerMTok || metrics.priceOutPerMTok)) {
+    const cost = (promptTokens * (metrics.priceInPerMTok ?? 0) + completionTokens * (metrics.priceOutPerMTok ?? 0)) / 1e6;
+    rows.push(["Estimated cost", `$${cost.toFixed(4)}`]);
+  }
+  rows.push(["AI time", formatSeconds(aiMs)]);
+  const total = formatSeconds(metrics.totalMs);
+  rows.push(["Total time", Number.isFinite(metrics.queueWaitMs) ? `${total} (queue wait ${formatSeconds(metrics.queueWaitMs)})` : total]);
+  if (Number.isFinite(metrics.diffChars)) {
+    rows.push([
+      "Diff",
+      `${formatNumber(metrics.reviewedFiles ?? 0)} files, ${formatNumber(metrics.diffChars)} chars in ${metrics.totalChunks ?? 1} chunk${(metrics.totalChunks ?? 1) === 1 ? "" : "s"}`,
+    ]);
+  }
+  if (metrics.headSha) {
+    rows.push(["Commit", `\`${metrics.headSha.slice(0, 7)}\``]);
+  }
+  const table = ["| Metric | Value |", "|---|---|", ...rows.map(([name, value]) => `| ${name} | ${value} |`)].join("\n");
+  return `<details>\n<summary>📊 Review metrics</summary>\n\n${table}\n\n</details>`;
+}
+
+export function buildMainComment({ summary, findings, passed, scope, tags = [], owner, repo, headSha, metrics }) {
   const emoji = passed ? "✅" : "❌";
   const heading = `## ${emoji} AI Review ${passed ? "Passed" : "Needs Attention"}`;
   const parsed = findings.map(parseFinding);
@@ -734,6 +815,10 @@ export function buildMainComment({ summary, findings, passed, scope, tags = [], 
 
   if (tags.length) {
     sections.push(`Tags: ${tags.map((tag) => `\`${tag}\``).join(", ")}`);
+  }
+  const metricsBlock = buildMetricsBlock(metrics);
+  if (metricsBlock) {
+    sections.push(metricsBlock);
   }
   return sections.join("\n\n");
 }

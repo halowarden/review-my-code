@@ -6,6 +6,7 @@ import {
   createFinalDecisionPrompt,
   dedupeInlineComments,
   extractAIOutput,
+  extractAIUsage,
   reconcileInlineComments,
   filterDiff,
   parseAIParams,
@@ -178,6 +179,7 @@ async function githubApiRequest(env, path, { method = "GET", body, headers = {},
 }
 
 async function requestAIReview(env, prompt) {
+  const startedAt = Date.now();
   const format = resolveAIFormat(env.AI_API_FORMAT);
   const { aiTimeoutMs } = resolveReviewSettings(env);
   const response = await fetchWithTimeout(
@@ -204,7 +206,11 @@ async function requestAIReview(env, prompt) {
   let payload;
   try {
     payload = await response.json();
-    return parseAIResponse(extractAIOutput(payload, format));
+    return {
+      ...parseAIResponse(extractAIOutput(payload, format)),
+      usage: extractAIUsage(payload),
+      durationMs: Date.now() - startedAt,
+    };
   } catch (error) {
     // Malformed model output is not worth a redelivery; the next push re-triggers a review.
     throw new ReviewError(`AI API returned unparseable JSON: ${error.message}`, { retriable: false });
@@ -396,7 +402,7 @@ async function setPullRequestReaction(env, job, content, login) {
         await githubApiRequest(env, `${base}/${reaction.id}`, { method: "DELETE", nonFatalStatuses: [403, 404] });
       }
     }
-    if (!existing.some?.((reaction) => reaction?.user?.login === login && reaction.content === content)) {
+    if (content && !existing.some?.((reaction) => reaction?.user?.login === login && reaction.content === content)) {
       await githubApiRequest(env, base, {
         method: "POST",
         nonFatalStatuses: [403, 404, 422],
@@ -406,6 +412,70 @@ async function setPullRequestReaction(env, job, content, login) {
   } catch (error) {
     log("error", "Failed to update PR reaction", { owner, repo, pullNumber, content, error: error.message });
   }
+}
+
+async function clearResultLabels(env, job) {
+  const { owner, repo, pullNumber } = job;
+  for (const label of [REVIEW_LABELS.passed, REVIEW_LABELS.needsFixes]) {
+    await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/labels/${encodeURIComponent(label)}`, {
+      method: "DELETE",
+      nonFatalStatuses: [403, 404, 422],
+    });
+  }
+}
+
+async function applyVerdictLabels(env, job, passed) {
+  const { owner, repo, pullNumber } = job;
+  // Only well-known labels are applied; AI-provided tags stay in the comment so a
+  // typo from the model can never create or fail on arbitrary repository labels.
+  await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/labels`, {
+    method: "POST",
+    nonFatalStatuses: [403, 404, 422],
+    body: JSON.stringify({ labels: [REVIEW_LABELS.reviewed, passed ? REVIEW_LABELS.passed : REVIEW_LABELS.needsFixes] }),
+  });
+  await githubApiRequest(
+    env,
+    `/repos/${owner}/${repo}/issues/${pullNumber}/labels/${encodeURIComponent(passed ? REVIEW_LABELS.needsFixes : REVIEW_LABELS.passed)}`,
+    { method: "DELETE", nonFatalStatuses: [403, 404, 422] },
+  );
+}
+
+/** Everything a viewer should see the moment a delivery is accepted: 👀 and no stale verdict labels. */
+async function acknowledgeDelivery(env, job) {
+  const login = await getBotLogin(env);
+  await Promise.all([setPullRequestReaction(env, job, "eyes", login), clearResultLabels(env, job)]);
+}
+
+function inProgressBody(job) {
+  const sha = job.headSha ? `\`${job.headSha.slice(0, 7)}\`` : "the latest commit";
+  return `## ⏳ AI Review in progress\n\n_Reviewing ${sha}. Previous findings were removed and will be replaced when the review finishes._\n\n${MAIN_MARKER}`;
+}
+
+function failureBody(job, error) {
+  const sha = job.headSha ? `\`${job.headSha.slice(0, 7)}\`` : "the latest commit";
+  const retry = isRetriableError(error) ? "The job will be retried automatically." : "Push a new commit to trigger another review.";
+  return `## 😕 AI Review failed\n\n_Could not review ${sha}: ${escapeForMarkdown(error.message).slice(0, 300)}. ${retry}_\n\n${MAIN_MARKER}`;
+}
+
+function escapeForMarkdown(text) {
+  return String(text).replace(/[<>]/g, (char) => (char === "<" ? "&lt;" : "&gt;"));
+}
+
+/**
+ * Before the AI is called: the previous review body becomes "in progress" and the
+ * bot's old inline comments disappear, so nobody reads stale findings meanwhile.
+ */
+async function markInProgress(env, job, login) {
+  await clearResultLabels(env, job);
+  const existingReview = await findMainReview(env, job, login);
+  if (existingReview) {
+    await githubApiRequest(env, `/repos/${job.owner}/${job.repo}/pulls/${job.pullNumber}/reviews/${existingReview.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ body: inProgressBody(job) }),
+    });
+  }
+  const deletedInline = await deleteBotInlineComments(env, job, login);
+  return { existingReview, deletedInline };
 }
 
 async function isHeadStale(env, job) {
@@ -419,19 +489,29 @@ async function isHeadStale(env, job) {
 
 export async function processReviewJob(env, job) {
   const { owner, repo, pullNumber } = job;
+  const startedAt = Date.now();
   const settings = resolveReviewSettings(env);
   const logFields = { owner, repo, pullNumber, headSha: job.headSha };
+  const login = await getBotLogin(env);
 
   if (await isHeadStale(env, job)) {
+    // A newer delivery owns the PR now and will set its own reaction.
     log("info", "Skipping stale review job: PR head moved on", logFields);
     return { skipped: true, reason: "stale-head" };
   }
 
   // Optional KV marker: a redelivered or replayed webhook for an already reviewed
-  // head costs one KV read instead of a full set of AI calls.
+  // head costs one KV read instead of a full set of AI calls. The stored value is
+  // the verdict reaction, so the 👀 set by the webhook can be turned back into it.
   const reviewedKey = job.headSha ? `reviewed:${owner}/${repo}/${pullNumber}/${job.headSha}` : null;
-  if (env.REVIEW_STATE && reviewedKey && (await env.REVIEW_STATE.get(reviewedKey))) {
+  const previousVerdict = env.REVIEW_STATE && reviewedKey ? await env.REVIEW_STATE.get(reviewedKey) : null;
+  if (previousVerdict) {
     log("info", "Skipping review job: head already reviewed", logFields);
+    const verdict = ["+1", "-1"].includes(previousVerdict) ? previousVerdict : null;
+    await setPullRequestReaction(env, job, verdict, login);
+    if (verdict) {
+      await applyVerdictLabels(env, job, verdict === "+1");
+    }
     return { skipped: true, reason: "already-reviewed" };
   }
 
@@ -443,20 +523,32 @@ export async function processReviewJob(env, job) {
 
   if (!filtered.diff) {
     log("info", "Nothing to review after filtering", { ...logFields, ignored: filtered.ignoredPaths.length });
+    await setPullRequestReaction(env, job, null, login);
     return { skipped: true, reason: "nothing-to-review", ignoredPaths: filtered.ignoredPaths };
   }
 
-  const login = await getBotLogin(env);
+  // Idempotent: the webhook handler normally set 👀 and cleared labels already.
   await setPullRequestReaction(env, job, "eyes", login);
+  const { existingReview, deletedInline } = await markInProgress(env, job, login);
   try {
-    return await runReview(env, job, settings, filtered, reviewedKey, login);
+    return await runReview(env, job, settings, filtered, reviewedKey, login, existingReview, deletedInline, startedAt);
   } catch (error) {
     await setPullRequestReaction(env, job, "confused", login);
+    if (existingReview) {
+      try {
+        await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews/${existingReview.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ body: failureBody(job, error) }),
+        });
+      } catch (updateError) {
+        log("error", "Could not mark review as failed", { ...logFields, error: updateError.message });
+      }
+    }
     throw error;
   }
 }
 
-async function runReview(env, job, settings, filtered, reviewedKey, login) {
+async function runReview(env, job, settings, filtered, reviewedKey, login, existingReview, deletedInline, startedAt) {
   const { owner, repo, pullNumber } = job;
   const logFields = { owner, repo, pullNumber, headSha: job.headSha };
 
@@ -482,13 +574,16 @@ async function runReview(env, job, settings, filtered, reviewedKey, login) {
   );
 
   const chunkResults = [];
+  const aiCalls = [];
   let failedChunks = 0;
   let firstFailure = null;
   chunkOutcomes.forEach((outcome, index) => {
     if (outcome.status === "fulfilled") {
       chunkResults.push(outcome.value);
+      aiCalls.push({ kind: "chunk", usage: outcome.value.usage, durationMs: outcome.value.durationMs });
     } else {
       failedChunks += 1;
+      aiCalls.push({ kind: "chunk", failed: true });
       firstFailure ??= outcome.reason;
       log("error", "Chunk review failed", { ...logFields, chunkIndex: index, error: outcome.reason?.message });
     }
@@ -515,6 +610,9 @@ async function runReview(env, job, settings, filtered, reviewedKey, login) {
           }),
         );
 
+  if (chunkResults.length > 1) {
+    aiCalls.push({ kind: "final", usage: decision.usage, durationMs: decision.durationMs });
+  }
   const findings = decision.findings.length ? decision.findings : chunkResults.flatMap((result) => result.findings);
   const passed = decision.passed;
   const tags = [...new Set([...chunkResults.flatMap((result) => result.tags), ...decision.tags].map((tag) => tag.trim()))];
@@ -535,6 +633,18 @@ async function runReview(env, job, settings, filtered, reviewedKey, login) {
     unreviewedChunks,
   });
 
+  const metrics = {
+    model: typeof env.AI_MODEL === "string" && env.AI_MODEL.trim() ? env.AI_MODEL.trim() : null,
+    calls: aiCalls,
+    totalMs: Date.now() - startedAt,
+    queueWaitMs: Number.isFinite(job.enqueuedAt) ? Math.max(0, startedAt - job.enqueuedAt) : undefined,
+    diffChars: filtered.diff.length,
+    reviewedFiles: filtered.reviewedPaths.length,
+    totalChunks: allChunks.length,
+    headSha: job.headSha,
+    priceInPerMTok: Number(env.AI_PRICE_IN_PER_MTOK) || 0,
+    priceOutPerMTok: Number(env.AI_PRICE_OUT_PER_MTOK) || 0,
+  };
   const body = buildMainComment({
     summary: decision.summary,
     findings,
@@ -544,18 +654,16 @@ async function runReview(env, job, settings, filtered, reviewedKey, login) {
     owner,
     repo,
     headSha: job.headSha,
+    metrics,
   });
   const mainBody = `${body}\n\n${MAIN_MARKER}`;
   const inline = reviewComments.map((comment) => ({ ...comment, body: `${comment.body}\n\n${INLINE_MARKER}` }));
   const commitFields = job.headSha ? { commit_id: job.headSha } : {};
   const reviewsPath = `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`;
 
-  // One review per PR: later runs update its body in place and replace the inline
-  // comments. GitHub cannot attach new inline comments to a submitted review, so
-  // refreshed inline comments ride on a short follow-up review.
-  const existingReview = await findMainReview(env, job, login);
-  const deletedInline = await deleteBotInlineComments(env, job, login);
-
+  // One review per PR: later runs update its body in place (markInProgress already
+  // removed the old inline comments). GitHub cannot attach new inline comments to a
+  // submitted review, so refreshed inline comments ride on a short follow-up review.
   async function createReview(reviewBody, comments) {
     const response = await githubApiRequest(env, reviewsPath, {
       method: "POST",
@@ -596,26 +704,19 @@ async function runReview(env, job, settings, filtered, reviewedKey, login) {
 
   await setPullRequestReaction(env, job, passed ? "+1" : "-1", login);
 
-  // Only well-known labels are applied; AI-provided tags stay in the comment so a
-  // typo from the model can never create or fail on arbitrary repository labels.
-  const labels = [REVIEW_LABELS.reviewed, passed ? REVIEW_LABELS.passed : REVIEW_LABELS.needsFixes];
-  await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/labels`, {
-    method: "POST",
-    nonFatalStatuses: [403, 404, 422],
-    body: JSON.stringify({ labels }),
-  });
-  await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/labels/${encodeURIComponent(passed ? REVIEW_LABELS.needsFixes : REVIEW_LABELS.passed)}`, {
-    method: "DELETE",
-    nonFatalStatuses: [403, 404, 422],
-  });
+  await applyVerdictLabels(env, job, passed);
 
   if (env.REVIEW_STATE && reviewedKey) {
-    await env.REVIEW_STATE.put(reviewedKey, new Date().toISOString(), { expirationTtl: REVIEWED_MARKER_TTL_SECONDS });
+    await env.REVIEW_STATE.put(reviewedKey, passed ? "+1" : "-1", { expirationTtl: REVIEWED_MARKER_TTL_SECONDS });
   }
 
   log("info", "Review posted", {
     ...logFields,
     passed,
+    totalMs: metrics.totalMs,
+    queueWaitMs: metrics.queueWaitMs,
+    promptTokens: aiCalls.reduce((sum, call) => sum + (call.usage?.promptTokens ?? 0), 0),
+    completionTokens: aiCalls.reduce((sum, call) => sum + (call.usage?.completionTokens ?? 0), 0),
     chunks: chunks.length,
     failedChunks,
     unreviewedChunks,
@@ -711,10 +812,21 @@ export default {
     }
 
     const deliveryId = request.headers.get("x-github-delivery");
+    // 👀 goes on the PR as soon as the delivery is accepted, without delaying the
+    // response: a couple of GitHub calls that cost no CPU time worth mentioning.
+    const acknowledge = acknowledgeDelivery(env, job).catch((error) => {
+      log("error", "Could not acknowledge delivery", { ...job, deliveryId, error: error.message });
+    });
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(acknowledge);
+    } else {
+      await acknowledge;
+    }
+
     if (env.REVIEW_QUEUE) {
       // GitHub gives a webhook 10 seconds; the review takes far longer. The queue
       // consumer has 15 minutes of wall time and only CPU time is billed.
-      await env.REVIEW_QUEUE.send(job);
+      await env.REVIEW_QUEUE.send({ ...job, enqueuedAt: Date.now() });
       log("info", "Review job queued", { ...job, deliveryId });
       return jsonResponse({ queued: true, ...job }, 202);
     }

@@ -17,7 +17,10 @@ Cloudflare Worker GitHub bot for AI-powered pull request review.
 - Keeps that single review per PR: later pushes update its body in place, delete the
   bot's previous inline comments, and attach refreshed inline comments to a short
   follow-up review (GitHub cannot add inline comments to an already submitted review)
-- Reacts on the PR itself: 👀 while the review runs, then 👍/👎, or 😕 if it failed
+- While a review runs: 👀 on the PR, verdict labels removed, the previous review body replaced by an
+  "⏳ in progress" placeholder and the bot's old inline comments deleted, so stale findings are never
+  shown; afterwards 👍/👎 (😕 on failure) and the final body with a collapsed 📊 metrics block
+  (tokens, AI time, queue wait, diff size, optional cost)
 - Applies `ai-reviewed` plus `ai-review:passed` or `ai-review:needs-fixes` and removes the
   opposite result label
 
@@ -108,6 +111,8 @@ Optional review tuning (`vars` in `wrangler.jsonc`):
   not reviewed in the scope line
 - `AI_CONCURRENCY` - parallel chunk requests (default 3)
 - `AI_TIMEOUT_MS` - per-request timeout for the AI endpoint (default 240000); a timeout is retried by the queue
+- `AI_PRICE_IN_PER_MTOK` / `AI_PRICE_OUT_PER_MTOK` - optional prices per million tokens; when set, the
+  collapsed metrics block under each review shows an estimated cost
 - `GITHUB_TIMEOUT_MS` - per-request timeout for the GitHub API (default 30000)
 - `REVIEW_IGNORE_PATTERNS` - comma-separated globs added to the built-in ignore list, e.g.
   `generated/, **/*.gen.ts`
