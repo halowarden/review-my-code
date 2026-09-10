@@ -6,6 +6,8 @@ export const DEFAULT_MAX_CHUNK_CHARS = 80_000;
 // Hard cap on AI calls per PR. Anything beyond is reported as "not reviewed".
 export const DEFAULT_MAX_CHUNKS = 8;
 export const DEFAULT_AI_CONCURRENCY = 3;
+export const DEFAULT_AI_TIMEOUT_MS = 240_000;
+export const DEFAULT_GITHUB_TIMEOUT_MS = 30_000;
 export const MAX_FILE_LIST_ENTRIES = 200;
 
 // Files that are never worth an AI call: lockfiles, vendored/generated output, caches.
@@ -314,6 +316,8 @@ export function resolveReviewSettings(env = {}) {
     maxChunkChars: readPositiveInt(env.AI_MAX_CHUNK_CHARS, DEFAULT_MAX_CHUNK_CHARS),
     maxChunks: readPositiveInt(env.AI_MAX_CHUNKS, DEFAULT_MAX_CHUNKS),
     concurrency: readPositiveInt(env.AI_CONCURRENCY, DEFAULT_AI_CONCURRENCY),
+    aiTimeoutMs: readPositiveInt(env.AI_TIMEOUT_MS, DEFAULT_AI_TIMEOUT_MS),
+    githubTimeoutMs: readPositiveInt(env.GITHUB_TIMEOUT_MS, DEFAULT_GITHUB_TIMEOUT_MS),
     ignorePatterns: parseIgnorePatterns(env.REVIEW_IGNORE_PATTERNS),
   };
 }
@@ -524,7 +528,15 @@ Diff${singleChunk ? "" : ` chunk ${chunkLabel}`}:
 ${diffChunk}`;
 }
 
-export function createFinalDecisionPrompt({ owner, repo, pullNumber, chunkFindings, totalChunks, reviewedChunks }) {
+export function createFinalDecisionPrompt({
+  owner,
+  repo,
+  pullNumber,
+  chunkFindings,
+  chunkInlineComments = [],
+  totalChunks,
+  reviewedChunks,
+}) {
   const chunkCount = Number.isInteger(totalChunks) && totalChunks > 0 ? totalChunks : "several";
   const reviewedCount = Number.isInteger(reviewedChunks) && reviewedChunks > 0 ? reviewedChunks : chunkCount;
   return `You are the final review adjudicator for pull request ${owner}/${repo}#${pullNumber}.
@@ -541,6 +553,7 @@ ${SEVERITY_MODEL}
 4. Do not invent findings and do not add details that are not supported by the chunk findings.
 5. Keep the finding line format: severity emoji, category emoji, bold title, path:line, impact and direction.
 6. Sort findings: 🔴 before 🟡; then 🔒 🐛 🛡️ 🔄 before 🧪 🧱 ⚡ 🔭 🧹; then by path.
+7. Reconcile inline comments. You also receive the chunk-level inline comments. Return only those whose finding survived, with the body's severity emoji updated to match the final severity; drop the rest. Never add an inline comment that no chunk produced and never change path or line.
 
 ## Verdict
 passed is true only when no 🔴 blocking finding survives adjudication.
@@ -552,16 +565,21 @@ Return strict JSON only. No markdown fences, no prose before or after the object
   "passed": boolean,
   "summary": "string",
   "tags": ["string"],
-  "findings": ["string"]
+  "findings": ["string"],
+  "inlineComments": [{"path": "file/path.ext", "line": 123, "body": "string"}]
 }
 
 Field rules:
 - summary: the verdict line, then one or two sentences of recommendation — what must be fixed before merge, or which follow-ups to open. Do not repeat every finding.
 - tags: at most three short area tags aggregated from the findings; [] when nothing survives.
 - findings: the deduplicated, sorted finding lines; [] when nothing survives.
+- inlineComments: the surviving chunk inline comments (same path and line), bodies aligned with final severity; [] when nothing survives.
 
 Chunk findings (JSON array of strings, in chunk order):
-${JSON.stringify(chunkFindings)}`;
+${JSON.stringify(chunkFindings)}
+
+Chunk inline comments (JSON array, in chunk order):
+${JSON.stringify(chunkInlineComments)}`;
 }
 
 export function buildScopeLine({ reviewedPaths = [], ignoredPaths = [], emptyPaths = [], totalChunks = 1, failedChunks = 0, unreviewedChunks = 0 }) {

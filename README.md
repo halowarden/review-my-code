@@ -102,6 +102,8 @@ Optional review tuning (`vars` in `wrangler.jsonc`):
 - `AI_MAX_CHUNKS` - maximum chunks reviewed per PR (default 8); the rest is reported as
   not reviewed in the scope line
 - `AI_CONCURRENCY` - parallel chunk requests (default 3)
+- `AI_TIMEOUT_MS` - per-request timeout for the AI endpoint (default 240000); a timeout is retried by the queue
+- `GITHUB_TIMEOUT_MS` - per-request timeout for the GitHub API (default 30000)
 - `REVIEW_IGNORE_PATTERNS` - comma-separated globs added to the built-in ignore list, e.g.
   `generated/, **/*.gen.ts`
 
@@ -133,8 +135,10 @@ one-line finding format `<severity> <category> **title** — path:line — impac
   added/context lines it can pin from the hunk header. In single-chunk mode it produces the
   final verdict directly.
 - Final prompt: merges duplicates across chunks, drops findings refuted by other chunks,
-  re-applies the quality gate, sorts by severity/category, and derives `passed` from the
-  surviving blocking findings.
+  re-applies the quality gate, sorts by severity/category, reconciles inline comments with
+  the surviving findings, and derives `passed` from the surviving blocking findings.
+- Both carry a "known false positives" list (single-threaded JS is not a race, deployer
+  config is trusted, test files in another chunk exist) learned from real runs.
 
 ## Failure handling
 

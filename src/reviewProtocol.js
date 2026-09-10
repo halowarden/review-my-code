@@ -15,6 +15,13 @@ export const SEVERITY_MODEL = `## Severity
 🟡 Non-blocking — real, but does not stop the merge: edge-case correctness gap; incomplete tests around otherwise-tested behavior; limited-impact performance issue; maintainability hazard; misleading naming with real comprehension cost; duplicated logic likely to drift; weak observability; cleanup worth tracking.
 ⚪ Do not report: style or formatting; subjective naming; theoretical micro-optimizations; speculative concerns with no concrete failure mode; obvious deliberate tradeoffs without evidence of harm; defensive checks that existing invariants already guarantee; compile-time-impossible null/undefined; problems in unchanged code unless this change makes them worse.
 
+## Known false positives — never report these
+- JavaScript/TypeScript is single-threaded: synchronous code between two awaits cannot interleave. A shared counter or flag that is read and updated without an await in between is not a race condition. Report a race only when an await, timer, or I/O sits between the check and the act.
+- Values that only the deployer controls (secrets, environment variables, wrangler/config files, CLI flags) are trusted configuration, not attacker input. Do not report SSRF, injection, or "unvalidated URL" for them.
+- "No tests" when a test file for the changed module is present in the reviewed file list, even if its content is in another chunk. Assume it covers the module unless you can see that it does not.
+- Resource identifiers that are not secrets (KV namespace ids, queue names, account ids) committed to config files.
+- Missing defensive checks for states that existing validation or types already exclude.
+
 ## Confidence
 High — failure follows directly from the code or contracts. Medium — strong evidence, but depends on a repository or runtime assumption. Low — speculative or missing context. Report only High and Medium findings; never post Low-confidence guesses.
 

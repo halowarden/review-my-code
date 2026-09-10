@@ -137,11 +137,13 @@ test("createChunkPrompt in single-chunk mode asks for a final verdict directly",
 
 test("createFinalDecisionPrompt keeps the adjudicator marker and adjudication rules", () => {
   const findings = ["🔴 🐛 **A** — a.js:1 — breaks", "🔴 🐛 **A** — a.js:1 — breaks"];
+  const inline = [{ path: "a.js", line: 1, body: "🔴 🐛 breaks" }];
   const prompt = createFinalDecisionPrompt({
     owner: "owner",
     repo: "repo",
     pullNumber: 7,
     chunkFindings: findings,
+    chunkInlineComments: inline,
     totalChunks: 4,
     reviewedChunks: 3,
   });
@@ -151,8 +153,9 @@ test("createFinalDecisionPrompt keeps the adjudicator marker and adjudication ru
   assert.match(prompt, /Merge duplicates/);
   assert.match(prompt, /Resolve contradictions/);
   assert.match(prompt, /passed is true only when no 🔴 blocking finding survives/);
-  assert.doesNotMatch(prompt, /"inlineComments"/);
-  assert.ok(prompt.endsWith(JSON.stringify(findings)));
+  assert.match(prompt, /Reconcile inline comments/);
+  assert.ok(prompt.includes(JSON.stringify(findings)));
+  assert.ok(prompt.endsWith(JSON.stringify(inline)));
 });
 
 test("createFinalDecisionPrompt tolerates a missing chunk count", () => {
@@ -490,13 +493,29 @@ test("multi-chunk PR runs the adjudicator and honours AI_CONCURRENCY", async () 
     diff: fileDiff("a.js", 3) + fileDiff("b.js", 3) + fileDiff("c.js", 3),
     ai: async (prompt) => {
       if (prompt.includes("final review adjudicator")) {
-        return { passed: false, summary: "⛔ Needs rework", tags: [], findings: ["merged finding"] };
+        assert.match(prompt, /"path":"a\.js","line":1/, "adjudicator receives chunk inline comments");
+        return {
+          passed: false,
+          summary: "⛔ Needs rework",
+          tags: [],
+          findings: ["merged finding"],
+          inlineComments: [{ path: "a.js", line: 1, body: "🟡 🐛 reconciled" }],
+        };
       }
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
       await new Promise((resolve) => setTimeout(resolve, 5));
       inFlight -= 1;
-      return { passed: true, summary: "chunk", tags: ["tests"], findings: ["chunk finding"], inlineComments: [] };
+      return {
+        passed: true,
+        summary: "chunk",
+        tags: ["tests"],
+        findings: ["chunk finding"],
+        inlineComments: [
+          { path: "a.js", line: 1, body: "🔴 🐛 chunk-level" },
+          { path: "b.js", line: 1, body: "🟡 🧹 dropped by adjudicator" },
+        ],
+      };
     },
   });
 
@@ -516,6 +535,8 @@ test("multi-chunk PR runs the adjudicator and honours AI_CONCURRENCY", async () 
     const commentBody = JSON.parse(calls.find((call) => call.url.includes("/issues/12/comments")).options.body).body;
     assert.match(commentBody, /- merged finding/);
     assert.match(commentBody, /Reviewed: 3 files in 3 chunks/);
+    const reviewBody = JSON.parse(calls.find((call) => call.url.includes("/pulls/12/reviews")).options.body);
+    assert.deepEqual(reviewBody.comments, [{ path: "a.js", line: 1, side: "RIGHT", body: "🟡 🐛 reconciled" }]);
   } finally {
     restore();
   }
@@ -585,6 +606,34 @@ test("all chunks failing throws a retriable error and posts nothing", async () =
     assert.equal(calls.some((call) => call.url.includes("/issues/12/comments")), false);
   } finally {
     restore();
+  }
+});
+
+test("AI timeouts are retriable and honour AI_TIMEOUT_MS", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    if (url.startsWith("https://ai.example/")) {
+      assert.ok(options.signal instanceof AbortSignal, "AI request carries an abort signal");
+      await new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(options.signal.reason));
+      });
+    }
+    if (url.endsWith("/pulls/12") && (options.headers?.Accept ?? "").includes("diff")) {
+      return new Response(SIMPLE_DIFF, { status: 200 });
+    }
+    return Response.json({});
+  };
+  try {
+    await assert.rejects(
+      processPullRequestReview({ ...BASE_ENV, AI_TIMEOUT_MS: "20" }, BASE_PAYLOAD),
+      (error) => {
+        assert.equal(error.name, "TimeoutError");
+        assert.equal(isRetriableError(error), true);
+        return true;
+      },
+    );
+  } finally {
+    global.fetch = originalFetch;
   }
 });
 
@@ -729,10 +778,10 @@ test("worker rejects unsigned, malformed, and oversized requests without reading
 
     const big = "x".repeat(3 * 1024 * 1024);
     const oversized = await worker.fetch(
-      webhookRequest(big, { "x-hub-signature-256": await hmacHeader("secret", "{}") }),
+      webhookRequest(big, { "x-hub-signature-256": await hmacHeader("secret", big) }),
       BASE_ENV,
     );
-    assert.equal(oversized.status, 413);
+    assert.equal(oversized.status, 413, "size limit rejects even a correctly signed oversized body");
 
     const otherEvent = await worker.fetch(webhookRequest("{}", { "x-github-event": "push" }), BASE_ENV);
     assert.equal(otherEvent.status, 200);

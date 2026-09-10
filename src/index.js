@@ -53,8 +53,13 @@ export function isRetriableError(error) {
   if (error instanceof ReviewError) {
     return error.retriable;
   }
-  // Network-level failures (DNS, reset, timeout) surface as TypeError from fetch.
-  return error instanceof TypeError;
+  // Network-level failures (DNS, reset) surface as TypeError; AbortSignal.timeout
+  // raises a DOMException named TimeoutError. Both are worth a retry.
+  return error instanceof TypeError || error?.name === "TimeoutError" || error?.name === "AbortError";
+}
+
+function fetchWithTimeout(url, init, timeoutMs) {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
 }
 
 /**
@@ -144,7 +149,8 @@ function constantTimeEqual(a, b) {
 }
 
 async function githubApiRequest(env, path, { method = "GET", body, headers = {}, nonFatalStatuses = [] } = {}) {
-  const response = await fetch(`https://api.github.com${path}`, {
+  const { githubTimeoutMs } = resolveReviewSettings(env);
+  const response = await fetchWithTimeout(`https://api.github.com${path}`, {
     method,
     headers: {
       Accept: "application/vnd.github+json",
@@ -154,7 +160,7 @@ async function githubApiRequest(env, path, { method = "GET", body, headers = {},
       ...headers,
     },
     body,
-  });
+  }, githubTimeoutMs);
 
   if (!response.ok) {
     if (nonFatalStatuses.includes(response.status)) {
@@ -172,14 +178,19 @@ async function githubApiRequest(env, path, { method = "GET", body, headers = {},
 
 async function requestAIReview(env, prompt) {
   const format = resolveAIFormat(env.AI_API_FORMAT);
-  const response = await fetch(resolveAIRequestUrl(env), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.AI_API_KEY}`,
+  const { aiTimeoutMs } = resolveReviewSettings(env);
+  const response = await fetchWithTimeout(
+    resolveAIRequestUrl(env),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${env.AI_API_KEY}`,
+      },
+      body: JSON.stringify(buildAIRequestBody(env, prompt)),
     },
-    body: JSON.stringify(buildAIRequestBody(env, prompt)),
-  });
+    aiTimeoutMs,
+  );
 
   if (!response.ok) {
     const text = (await response.text()).slice(0, 500);
@@ -386,6 +397,7 @@ export async function processReviewJob(env, job) {
             repo,
             pullNumber,
             chunkFindings: chunkResults.flatMap((result) => result.findings),
+            chunkInlineComments: dedupeInlineComments(chunkResults.flatMap((result) => result.inlineComments)),
             totalChunks: chunks.length,
             reviewedChunks: chunkResults.length,
           }),
@@ -394,7 +406,11 @@ export async function processReviewJob(env, job) {
   const findings = decision.findings.length ? decision.findings : chunkResults.flatMap((result) => result.findings);
   const passed = decision.passed;
   const tags = [...new Set([...chunkResults.flatMap((result) => result.tags), ...decision.tags].map((tag) => tag.trim()))];
-  const inlineComments = dedupeInlineComments(chunkResults.flatMap((result) => result.inlineComments));
+  // Single chunk: the chunk's comments are final. Several chunks: the adjudicator
+  // returns the comments whose findings survived, with severity reconciled.
+  const inlineComments = dedupeInlineComments(
+    chunkResults.length === 1 ? chunkResults[0].inlineComments : decision.inlineComments,
+  );
   const reviewComments = buildReviewComments(inlineComments, reviewableByPath);
   const scope = buildScopeLine({
     reviewedPaths: filtered.reviewedPaths,
