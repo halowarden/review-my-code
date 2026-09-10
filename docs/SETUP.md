@@ -198,17 +198,15 @@ Manually:
 npm test && npm run deploy
 ```
 
-Automatically: `.github/workflows/deploy.yml` deploys every push to `main` (and can be run
-by hand from the Actions tab). It needs two repository secrets:
+Automatically, with Cloudflare Workers Builds (no Cloudflare token in GitHub needed):
 
-- `CLOUDFLARE_ACCOUNT_ID` - from `npx wrangler whoami`
-- `CLOUDFLARE_API_TOKEN` - create at https://dash.cloudflare.com/profile/api-tokens with the
-  **Edit Cloudflare Workers** template (it covers Workers scripts, KV, and Queues)
-
-```bash
-gh secret set CLOUDFLARE_ACCOUNT_ID --repo <owner>/<repo>
-gh secret set CLOUDFLARE_API_TOKEN --repo <owner>/<repo>
-```
+1. Cloudflare dashboard → Workers & Pages → `review-my-code-bot` → Settings → Build.
+2. Connect the GitHub repository (install the Cloudflare GitHub App on the organisation,
+   limited to this repository).
+3. Production branch: `main`. Build command: `npm test`. Deploy command: leave the default
+   `npx wrangler deploy`. Root directory: `/`.
+4. Save. Every push to `main` now runs the tests and deploys; failed tests block the deploy.
+   Pushes to other branches upload a preview version without touching production.
 
 `.github/workflows/ci.yml` runs the tests and a dry-run deploy on every pull request.
 
