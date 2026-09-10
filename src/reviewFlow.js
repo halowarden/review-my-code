@@ -31,24 +31,24 @@ export function dedupeInlineComments(inlineComments = []) {
   const seen = new Set();
 
   for (const comment of inlineComments) {
+    const lineNumber = Number(comment?.line);
     const key = [
       comment?.path ?? "",
-      comment?.line ?? "",
+      lineNumber,
       (comment?.body ?? "").trim().toLowerCase(),
     ].join("|");
 
     if (
       !comment?.path ||
-      comment?.line === undefined ||
-      comment?.line === null ||
-      Number.isNaN(Number(comment?.line)) ||
+      !Number.isInteger(lineNumber) ||
+      lineNumber <= 0 ||
       !comment?.body ||
       seen.has(key)
     ) {
       continue;
     }
     seen.add(key);
-    unique.push(comment);
+    unique.push({ ...comment, line: lineNumber });
   }
 
   return unique;

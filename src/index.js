@@ -95,6 +95,63 @@ function shouldHandleEvent(action, draft) {
   return ["opened", "synchronize", "reopened", "ready_for_review"].includes(action);
 }
 
+function parseReviewableLinesFromDiff(diff) {
+  const reviewableByPath = new Map();
+  const lines = diff.split("\n");
+  let currentPath = null;
+  let rightLine = null;
+
+  for (const line of lines) {
+    if (line.startsWith("+++ ")) {
+      const nextPath = line.slice(4).trim();
+      currentPath = nextPath.startsWith("b/") ? nextPath.slice(2) : nextPath;
+      if (currentPath === "/dev/null") {
+        currentPath = null;
+      }
+      if (currentPath && !reviewableByPath.has(currentPath)) {
+        reviewableByPath.set(currentPath, new Set());
+      }
+      rightLine = null;
+      continue;
+    }
+
+    if (line.startsWith("@@ ")) {
+      const match = line.match(/\+(\d+)(?:,\d+)?/);
+      rightLine = match ? Number(match[1]) : null;
+      continue;
+    }
+
+    if (!currentPath || rightLine === null) {
+      continue;
+    }
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      reviewableByPath.get(currentPath).add(rightLine);
+      rightLine += 1;
+    } else if (line.startsWith(" ")) {
+      reviewableByPath.get(currentPath).add(rightLine);
+      rightLine += 1;
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      // Left-side line only; right-side line number does not advance.
+    } else if (line.startsWith("\\")) {
+      // No newline marker.
+    }
+  }
+
+  return reviewableByPath;
+}
+
+function buildReviewComments(inlineComments, reviewableByPath) {
+  return inlineComments
+    .filter((comment) => reviewableByPath.get(comment.path)?.has(comment.line))
+    .map((comment) => ({
+      path: comment.path,
+      line: comment.line,
+      side: "RIGHT",
+      body: comment.body,
+    }));
+}
+
 async function processPullRequestReview(env, payload) {
   const { repository, pull_request: pullRequest, action } = payload;
   if (!repository || !pullRequest || !shouldHandleEvent(action, pullRequest.draft)) {
@@ -110,6 +167,7 @@ async function processPullRequestReview(env, payload) {
   });
   const diff = await diffResponse.text();
   const chunks = splitDiffIntoChunks(diff);
+  const reviewableByPath = parseReviewableLinesFromDiff(diff);
 
   const chunkResults = [];
   for (let i = 0; i < chunks.length; i += 1) {
@@ -160,18 +218,15 @@ async function processPullRequestReview(env, payload) {
     body: JSON.stringify({ content: passed ? "+1" : "-1" }),
   });
 
-  if (inlineComments.length > 0) {
+  const reviewComments = buildReviewComments(inlineComments, reviewableByPath);
+
+  if (reviewComments.length > 0) {
     await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`, {
       method: "POST",
       body: JSON.stringify({
         body: "Inline AI review comments.",
         event: "COMMENT",
-        comments: inlineComments.map((comment) => ({
-          path: comment.path,
-          line: comment.line,
-          side: "RIGHT",
-          body: comment.body,
-        })),
+        comments: reviewComments,
       }),
     });
   }
@@ -227,4 +282,10 @@ export default {
   },
 };
 
-export { processPullRequestReview, shouldHandleEvent, verifyGitHubSignature };
+export {
+  buildReviewComments,
+  parseReviewableLinesFromDiff,
+  processPullRequestReview,
+  shouldHandleEvent,
+  verifyGitHubSignature,
+};

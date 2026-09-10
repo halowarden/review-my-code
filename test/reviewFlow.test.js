@@ -20,7 +20,8 @@ test("dedupeInlineComments removes duplicates and invalid comments", () => {
   const input = [
     { path: "src/a.js", line: 10, body: "Fix this" },
     { path: "src/a.js", line: 10, body: "fix this " },
-    { path: "src/a.js", line: 0, body: "Zero line allowed" },
+    { path: "src/a.js", line: 0, body: "Zero line rejected" },
+    { path: "src/a.js", line: 1.5, body: "Decimal rejected" },
     { path: "src/b.js", line: 2, body: "Nit" },
     { path: "", line: 2, body: "Missing path" },
   ];
@@ -28,7 +29,6 @@ test("dedupeInlineComments removes duplicates and invalid comments", () => {
   const result = dedupeInlineComments(input);
   assert.deepEqual(result, [
     { path: "src/a.js", line: 10, body: "Fix this" },
-    { path: "src/a.js", line: 0, body: "Zero line allowed" },
     { path: "src/b.js", line: 2, body: "Nit" },
   ]);
 });
@@ -65,7 +65,10 @@ test("processPullRequestReview posts inline review payload from AI comments", as
     calls.push({ url, options });
 
     if (url.includes("/pulls/12") && options.method !== "POST") {
-      return new Response("diff --git a/a.js b/a.js\n@@ -1 +1 @@\n-console.log(1)\n+console.log(2)\n", { status: 200 });
+      return new Response(
+        "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-console.log(1)\n+console.log(2)\n",
+        { status: 200 },
+      );
     }
     if (url === "https://ai.example/review") {
       const request = JSON.parse(options.body);
@@ -112,6 +115,63 @@ test("processPullRequestReview posts inline review payload from AI comments", as
     assert.equal(reviewBody.comments[0].path, "a.js");
     assert.equal(reviewBody.comments[0].line, 1);
     assert.equal(reviewBody.comments[0].side, "RIGHT");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("processPullRequestReview filters non-reviewable inline comment lines", async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+
+    if (url.includes("/pulls/12") && options.method !== "POST") {
+      return new Response(
+        "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-console.log(1)\n+console.log(2)\n",
+        { status: 200 },
+      );
+    }
+    if (url === "https://ai.example/review") {
+      const request = JSON.parse(options.body);
+      if (request.prompt.includes("final review adjudicator")) {
+        return Response.json({
+          passed: false,
+          summary: "Needs fixes",
+          tags: ["ai-review:needs-fixes"],
+          findings: ["Fix issue"],
+        });
+      }
+      return Response.json({
+        passed: false,
+        summary: "Chunk result",
+        tags: ["ai-reviewed"],
+        findings: ["Fix issue"],
+        inlineComments: [{ path: "a.js", line: 999, body: "Out of diff" }],
+      });
+    }
+    if (url.includes("/issues/12/comments")) {
+      return Response.json({ id: 99 });
+    }
+    return Response.json({});
+  };
+
+  try {
+    await processPullRequestReview(
+      {
+        GITHUB_TOKEN: "token",
+        AI_API_URL: "https://ai.example/review",
+        AI_API_KEY: "key",
+      },
+      {
+        action: "opened",
+        repository: { name: "repo", owner: { login: "owner" } },
+        pull_request: { number: 12, draft: false },
+      },
+    );
+
+    const reviewCall = calls.find((call) => call.url.includes("/pulls/12/reviews"));
+    assert.equal(reviewCall, undefined);
   } finally {
     global.fetch = originalFetch;
   }
