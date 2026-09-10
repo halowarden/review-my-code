@@ -821,6 +821,32 @@ test("AI timeouts are retriable and honour AI_TIMEOUT_MS", async () => {
   }
 });
 
+test("a GitHub failure before the review starts is reported on the PR", async () => {
+  const originalFetch = global.fetch;
+  const { calls, restore } = mockFetch();
+  const mocked = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    if (url.endsWith("/pulls/12") && (options.headers?.Accept ?? "").includes("diff")) {
+      calls.push({ url, options });
+      return new Response('{"message":"Resource not accessible by personal access token"}', { status: 403 });
+    }
+    return mocked(url, options);
+  };
+  try {
+    await assert.rejects(processPullRequestReview(BASE_ENV, BASE_PAYLOAD), (error) => {
+      assert.equal(isRetriableError(error), false);
+      return true;
+    });
+    assert.deepEqual(reactionContents(calls), ["confused"]);
+    const posted = postedReviewBody(calls);
+    assert.match(posted.body, /^## 😕 AI Review failed[\s\S]*403[\s\S]*Push a new commit/);
+    assert.deepEqual(posted.comments, []);
+  } finally {
+    restore();
+    global.fetch = originalFetch;
+  }
+});
+
 test("AI 4xx errors are not retriable", async () => {
   const { restore } = mockFetch({ ai: () => new Response("bad key", { status: 401 }) });
   try {

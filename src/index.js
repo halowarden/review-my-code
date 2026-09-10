@@ -493,58 +493,75 @@ export async function processReviewJob(env, job) {
   const settings = resolveReviewSettings(env);
   const logFields = { owner, repo, pullNumber, headSha: job.headSha };
   const login = await getBotLogin(env);
+  let existingReview = null;
 
-  if (await isHeadStale(env, job)) {
-    // A newer delivery owns the PR now and will set its own reaction.
-    log("info", "Skipping stale review job: PR head moved on", logFields);
-    return { skipped: true, reason: "stale-head" };
-  }
-
-  // Optional KV marker: a redelivered or replayed webhook for an already reviewed
-  // head costs one KV read instead of a full set of AI calls. The stored value is
-  // the verdict reaction, so the 👀 set by the webhook can be turned back into it.
-  const reviewedKey = job.headSha ? `reviewed:${owner}/${repo}/${pullNumber}/${job.headSha}` : null;
-  const previousVerdict = env.REVIEW_STATE && reviewedKey ? await env.REVIEW_STATE.get(reviewedKey) : null;
-  if (previousVerdict) {
-    log("info", "Skipping review job: head already reviewed", logFields);
-    const verdict = ["+1", "-1"].includes(previousVerdict) ? previousVerdict : null;
-    await setPullRequestReaction(env, job, verdict, login);
-    if (verdict) {
-      await applyVerdictLabels(env, job, verdict === "+1");
-    }
-    return { skipped: true, reason: "already-reviewed" };
-  }
-
-  const diffResponse = await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}`, {
-    headers: { Accept: "application/vnd.github.v3.diff" },
-  });
-  const rawDiff = await diffResponse.text();
-  const filtered = filterDiff(rawDiff, settings.ignorePatterns);
-
-  if (!filtered.diff) {
-    log("info", "Nothing to review after filtering", { ...logFields, ignored: filtered.ignoredPaths.length });
-    await setPullRequestReaction(env, job, null, login);
-    return { skipped: true, reason: "nothing-to-review", ignoredPaths: filtered.ignoredPaths };
-  }
-
-  // Idempotent: the webhook handler normally set 👀 and cleared labels already.
-  await setPullRequestReaction(env, job, "eyes", login);
-  const { existingReview, deletedInline } = await markInProgress(env, job, login);
   try {
-    return await runReview(env, job, settings, filtered, reviewedKey, login, existingReview, deletedInline, startedAt);
-  } catch (error) {
-    await setPullRequestReaction(env, job, "confused", login);
-    if (existingReview) {
-      try {
-        await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews/${existingReview.id}`, {
-          method: "PUT",
-          body: JSON.stringify({ body: failureBody(job, error) }),
-        });
-      } catch (updateError) {
-        log("error", "Could not mark review as failed", { ...logFields, error: updateError.message });
-      }
+    if (await isHeadStale(env, job)) {
+      // A newer delivery owns the PR now and will set its own reaction.
+      log("info", "Skipping stale review job: PR head moved on", logFields);
+      return { skipped: true, reason: "stale-head" };
     }
+
+    // Optional KV marker: a redelivered or replayed webhook for an already reviewed
+    // head costs one KV read instead of a full set of AI calls. The stored value is
+    // the verdict reaction, so the 👀 set by the webhook can be turned back into it.
+    const reviewedKey = job.headSha ? `reviewed:${owner}/${repo}/${pullNumber}/${job.headSha}` : null;
+    const previousVerdict = env.REVIEW_STATE && reviewedKey ? await env.REVIEW_STATE.get(reviewedKey) : null;
+    if (previousVerdict) {
+      log("info", "Skipping review job: head already reviewed", logFields);
+      const verdict = ["+1", "-1"].includes(previousVerdict) ? previousVerdict : null;
+      await setPullRequestReaction(env, job, verdict, login);
+      if (verdict) {
+        await applyVerdictLabels(env, job, verdict === "+1");
+      }
+      return { skipped: true, reason: "already-reviewed" };
+    }
+
+    const diffResponse = await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}`, {
+      headers: { Accept: "application/vnd.github.v3.diff" },
+    });
+    const rawDiff = await diffResponse.text();
+    const filtered = filterDiff(rawDiff, settings.ignorePatterns);
+
+    if (!filtered.diff) {
+      log("info", "Nothing to review after filtering", { ...logFields, ignored: filtered.ignoredPaths.length });
+      await setPullRequestReaction(env, job, null, login);
+      return { skipped: true, reason: "nothing-to-review", ignoredPaths: filtered.ignoredPaths };
+    }
+
+    // Idempotent: the webhook handler normally set 👀 and cleared labels already.
+    await setPullRequestReaction(env, job, "eyes", login);
+    const marked = await markInProgress(env, job, login);
+    existingReview = marked.existingReview;
+    return await runReview(env, job, settings, filtered, reviewedKey, login, existingReview, marked.deletedInline, startedAt);
+  } catch (error) {
+    // Whatever failed, the PR must show it: 😕 plus the reason in the review body.
+    await setPullRequestReaction(env, job, "confused", login);
+    await reportFailure(env, job, existingReview, error, logFields);
     throw error;
+  }
+}
+
+async function reportFailure(env, job, existingReview, error, logFields) {
+  const { owner, repo, pullNumber } = job;
+  const reviewsPath = `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`;
+  try {
+    if (!existingReview) {
+      existingReview = await findMainReview(env, job, await getBotLogin(env));
+    }
+    if (existingReview) {
+      await githubApiRequest(env, `${reviewsPath}/${existingReview.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ body: failureBody(job, error) }),
+      });
+    } else {
+      await githubApiRequest(env, reviewsPath, {
+        method: "POST",
+        body: JSON.stringify({ body: failureBody(job, error), event: "COMMENT", comments: [] }),
+      });
+    }
+  } catch (updateError) {
+    log("error", "Could not report the failure on the PR", { ...logFields, error: updateError.message });
   }
 }
 
