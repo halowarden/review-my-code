@@ -250,7 +250,7 @@ async function processPullRequestReview(env, payload) {
   return {
     skipped: false,
     passed,
-    inlineCommentsCount: inlineComments.length,
+    inlineCommentsCount: reviewComments.length,
     tagCount: tags.size,
   };
 }
