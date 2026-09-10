@@ -77,8 +77,10 @@ https://github.com/settings/personal-access-tokens/new:
 - Resource owner: the account or organisation that owns the repository
 - Repository access: only the repositories the bot should review
 - Repository permissions:
-  - Pull requests: **Read and write** (comments, reviews, labels)
-  - Contents: **Read** (the diff)
+  - Pull requests: **Read and write** (comments, reviews, labels, reactions)
+  - Contents: **Read** (the diff; without it private repositories fail with `403`)
+  - Issues: **Read** (optional; lets the bot list and clean up its own reactions when the
+    `REVIEW_STATE` KV binding is not configured)
   - Metadata: Read (added automatically)
 
 Comments will appear as the user who owns the token. A dedicated bot account keeps
@@ -219,7 +221,9 @@ redeploy.
 |---|---|---|
 | Delivery shows `401 Invalid signature` | secret mismatch or form-encoded content type | set the same secret on both sides, content type `application/json` |
 | Delivery shows `500 Missing required environment variables` | a secret is not set | `npx wrangler secret list`, add the missing one |
-| Delivery `202` but no comment | consumer failed | `npx wrangler tail`, look for `Queue message failed` |
+| Delivery `202` but no comment | consumer failed | the PR shows 😕 and a "😕 AI Review failed" review with the error; details in `npx wrangler tail` (`Queue message failed`) |
+| `😕 AI Review failed … (403) … Resource not accessible by personal access token` | token lacks a permission, usually `Contents: read` on a private repo | add the permission to the token, no re-issue needed, then push or toggle draft |
+| 👀 stays next to 👍/👎 | bot could not list its reactions on a private repo | configure `REVIEW_STATE` (KV) or add `Issues: read` to the token |
 | `Skipping review job: PR head moved on` | a newer push arrived before the review ran | expected, the newer delivery reviews the new head |
 | `nothing-to-review` | only ignored files changed (lockfiles, generated, binary) | expected |
 | Labels missing on the PR | labels do not exist in the repo | step 8 |

@@ -388,26 +388,70 @@ async function deleteBotInlineComments(env, job, login) {
 
 /**
  * Replaces the bot's own reaction on the pull request itself: 👀 while a review
- * is running, 👍/👎 when it is done, 😕 when it failed. Reactions are cosmetic,
- * so permission problems are logged and never fail the review.
+ * is running, 👍/👎 when it is done, 😕 when it failed, null to remove it.
+ *
+ * The id of the reaction we set is remembered in KV (when bound), so it can be
+ * deleted later without listing reactions — listing needs "Issues: read" on
+ * private repositories, which the bot token may not have. Listing is still
+ * attempted as a best-effort sweep for strays. Reactions are cosmetic, so
+ * permission problems are logged and never fail the review.
  */
 async function setPullRequestReaction(env, job, content, login) {
   const { owner, repo, pullNumber } = job;
   const base = `/repos/${owner}/${repo}/issues/${pullNumber}/reactions`;
+  const stateKey = `reaction:${owner}/${repo}/${pullNumber}`;
   try {
+    let remembered = null;
+    if (env.REVIEW_STATE) {
+      try {
+        remembered = JSON.parse((await env.REVIEW_STATE.get(stateKey)) ?? "null");
+      } catch {
+        remembered = null;
+      }
+    }
+
+    let alreadySet = false;
+    if (remembered?.id) {
+      if (remembered.content === content) {
+        alreadySet = true;
+      } else {
+        await githubApiRequest(env, `${base}/${remembered.id}`, { method: "DELETE", nonFatalStatuses: [403, 404] });
+        remembered = null;
+      }
+    }
+
     const listResponse = await githubApiRequest(env, `${base}?per_page=100`, { nonFatalStatuses: [403, 404] });
     const existing = listResponse.ok ? await listResponse.json() : [];
     for (const reaction of Array.isArray(existing) ? existing : []) {
-      if (reaction?.user?.login === login && BOT_REACTIONS.includes(reaction.content) && reaction.content !== content) {
+      if (reaction?.user?.login !== login || !BOT_REACTIONS.includes(reaction.content)) {
+        continue;
+      }
+      if (reaction.content === content) {
+        alreadySet = true;
+        remembered = { id: reaction.id, content };
+      } else if (reaction.id !== remembered?.id) {
         await githubApiRequest(env, `${base}/${reaction.id}`, { method: "DELETE", nonFatalStatuses: [403, 404] });
       }
     }
-    if (content && !existing.some?.((reaction) => reaction?.user?.login === login && reaction.content === content)) {
-      await githubApiRequest(env, base, {
+
+    if (content && !alreadySet) {
+      const response = await githubApiRequest(env, base, {
         method: "POST",
         nonFatalStatuses: [403, 404, 422],
         body: JSON.stringify({ content }),
       });
+      if (response.ok) {
+        const created = await response.json();
+        remembered = created?.id ? { id: created.id, content } : null;
+      }
+    }
+
+    if (env.REVIEW_STATE) {
+      if (content && remembered?.id) {
+        await env.REVIEW_STATE.put(stateKey, JSON.stringify(remembered), { expirationTtl: REVIEWED_MARKER_TTL_SECONDS });
+      } else if (!content) {
+        await env.REVIEW_STATE.delete(stateKey);
+      }
     }
   } catch (error) {
     log("error", "Failed to update PR reaction", { owner, repo, pullNumber, content, error: error.message });

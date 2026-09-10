@@ -74,8 +74,10 @@ function mockFetch({
   reactions = [],
   existingReviews = [],
   existingInline = [],
+  reactionsStatus = 200,
 } = {}) {
   const calls = [];
+  let reactionCounter = 0;
   const originalFetch = global.fetch;
   global.fetch = async (url, options = {}) => {
     calls.push({ url, options });
@@ -104,7 +106,11 @@ function mockFetch({
       return Response.json(url.includes("page=1") ? existingInline : []);
     }
     if (url.includes("/issues/12/reactions") && options.method !== "POST" && options.method !== "DELETE") {
-      return Response.json(reactions);
+      return reactionsStatus === 200 ? Response.json(reactions) : new Response("no", { status: reactionsStatus });
+    }
+    if (url.endsWith("/issues/12/reactions") && options.method === "POST") {
+      reactionCounter += 1;
+      return Response.json({ id: 1000 + reactionCounter, content: JSON.parse(options.body).content });
     }
     if (url.includes("/issues/12/labels")) {
       return new Response(labelsStatus === 200 ? "{}" : "missing labels", { status: labelsStatus });
@@ -878,6 +884,25 @@ test("lockfile-only PR makes no AI call and posts nothing", async () => {
   }
 });
 
+test("reactions are tracked in KV and replaced by id when listing is forbidden (private repo)", async () => {
+  const store = new Map();
+  const kv = {
+    get: async (key) => store.get(key)?.value ?? null,
+    put: async (key, value, options) => store.set(key, { value, options }),
+    delete: async (key) => store.delete(key),
+  };
+  const { calls, restore } = mockFetch({ reactionsStatus: 403 });
+  try {
+    await processReviewJob({ ...BASE_ENV, REVIEW_STATE: kv }, { owner: "owner", repo: "repo", pullNumber: 12, headSha: null });
+    assert.deepEqual(reactionContents(calls), ["eyes", "+1"]);
+    const deletes = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/reactions/"));
+    assert.deepEqual(deletes.map((call) => call.url.split("/").pop()), ["1001"], "the remembered 👀 is deleted by id without listing");
+    assert.deepEqual(JSON.parse(store.get("reaction:owner/repo/12").value), { id: 1002, content: "+1" });
+  } finally {
+    restore();
+  }
+});
+
 test("nothing-to-review removes the 👀 set by the webhook", async () => {
   const { calls, restore } = mockFetch({
     diff: fileDiff("package-lock.json", 5),
@@ -928,7 +953,8 @@ test("REVIEW_STATE marker skips already reviewed heads and is written after post
     const second = await processReviewJob({ ...BASE_ENV, REVIEW_STATE: kv }, job);
     assert.deepEqual(second, { skipped: true, reason: "already-reviewed" });
     assert.equal(calls.filter((call) => call.url === "https://ai.example/review").length, aiCallsBefore);
-    assert.deepEqual(reactionContents(calls).slice(reactionsBefore), ["+1"], "👀 from the webhook is turned back into the stored verdict");
+    assert.deepEqual(reactionContents(calls).slice(reactionsBefore), [], "the remembered 👍 is already in place, nothing to re-post");
+    assert.deepEqual(JSON.parse(store.get("reaction:owner/repo/12").value).content, "+1");
     const labelPosts = calls.filter((call) => call.url.endsWith("/labels") && call.options.method === "POST");
     assert.deepEqual(JSON.parse(labelPosts[labelPostsBefore].options.body).labels, ["ai-reviewed", "ai-review:passed"], "labels restored too");
   } finally {

@@ -122,7 +122,9 @@ Bindings:
 - `REVIEW_QUEUE` - queue producer/consumer. Without it the Worker falls back to
   `ctx.waitUntil`, which Cloudflare cuts off 30 s after the response, so long reviews can
   be lost. Use the queue in production.
-- `REVIEW_STATE` - optional KV namespace remembering reviewed head SHAs for 30 days.
+- `REVIEW_STATE` - optional KV namespace remembering reviewed head SHAs and the id of the bot's
+  PR reaction for 30 days. Without it, replacing 👀 relies on listing reactions, which needs
+  `Issues: read` on private repositories.
 
 ## Ignored by default
 
@@ -153,6 +155,7 @@ one-line finding format `<severity> <category> **title** — path:line — impac
 ## Failure handling
 
 - AI or GitHub `5xx`/`429`/network errors are retried by the queue (2 retries, 1–2 min delay).
-- `4xx` and unparseable model output are logged and dropped; the next push re-triggers a review.
+- `4xx` and unparseable model output are not retried; the PR gets 😕 and a review body that states
+  the error (e.g. a GitHub `403` when the token lacks `Contents: read`). The next push re-triggers.
 - A single failed chunk does not fail the review: the scope line says which chunks were not
   reviewed. Only when every chunk fails is the job retried.
