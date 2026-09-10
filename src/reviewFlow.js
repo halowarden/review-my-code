@@ -10,6 +10,17 @@ export function splitDiffIntoChunks(diff, maxChunkSize = MAX_DIFF_CHUNK_SIZE) {
   const lines = diff.split("\n");
 
   for (const line of lines) {
+    if (line.length > maxChunkSize) {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      for (let i = 0; i < line.length; i += maxChunkSize) {
+        chunks.push(line.slice(i, i + maxChunkSize));
+      }
+      continue;
+    }
+
     const candidate = currentChunk ? `${currentChunk}\n${line}` : line;
     if (candidate.length > maxChunkSize && currentChunk) {
       chunks.push(currentChunk);

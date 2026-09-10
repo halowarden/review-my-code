@@ -16,6 +16,14 @@ test("splitDiffIntoChunks splits large diffs into multiple chunks", () => {
   assert.equal(chunks.join("\n"), diff);
 });
 
+test("splitDiffIntoChunks hard-limits chunk size for oversized lines", () => {
+  const diff = "x".repeat(105);
+  const chunks = splitDiffIntoChunks(diff, 20);
+
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => chunk.length <= 20));
+});
+
 test("dedupeInlineComments removes duplicates and invalid comments", () => {
   const input = [
     { path: "src/a.js", line: 10, body: "Fix this" },
@@ -91,6 +99,9 @@ test("processPullRequestReview posts inline review payload from AI comments", as
     if (url.includes("/issues/12/comments")) {
       return Response.json({ id: 99 });
     }
+    if (url.includes("/issues/12/labels")) {
+      return Response.json({ ok: true });
+    }
     return Response.json({});
   };
 
@@ -115,6 +126,11 @@ test("processPullRequestReview posts inline review payload from AI comments", as
     assert.equal(reviewBody.comments[0].path, "a.js");
     assert.equal(reviewBody.comments[0].line, 1);
     assert.equal(reviewBody.comments[0].side, "RIGHT");
+
+    const labelsCall = calls.find((call) => call.url.includes("/issues/12/labels"));
+    assert.ok(labelsCall);
+    const labelsBody = JSON.parse(labelsCall.options.body);
+    assert.ok(labelsBody.labels.includes("ai-reviewed"));
   } finally {
     global.fetch = originalFetch;
   }
@@ -153,6 +169,9 @@ test("processPullRequestReview filters non-reviewable inline comment lines", asy
     if (url.includes("/issues/12/comments")) {
       return Response.json({ id: 99 });
     }
+    if (url.includes("/issues/12/labels")) {
+      return Response.json({ ok: true });
+    }
     return Response.json({});
   };
 
@@ -172,6 +191,55 @@ test("processPullRequestReview filters non-reviewable inline comment lines", asy
 
     const reviewCall = calls.find((call) => call.url.includes("/pulls/12/reviews"));
     assert.equal(reviewCall, undefined);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("processPullRequestReview tolerates missing labels", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    if (url.includes("/pulls/12") && options.method !== "POST") {
+      return new Response(
+        "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-console.log(1)\n+console.log(2)\n",
+        { status: 200 },
+      );
+    }
+    if (url === "https://ai.example/review") {
+      const request = JSON.parse(options.body);
+      if (request.prompt.includes("final review adjudicator")) {
+        return Response.json({ passed: true, summary: "ok", tags: [], findings: [] });
+      }
+      return Response.json({ passed: true, summary: "ok", tags: [], findings: [], inlineComments: [] });
+    }
+    if (url.includes("/issues/12/comments")) {
+      return Response.json({ id: 99 });
+    }
+    if (url.includes("/issues/comments/99/reactions")) {
+      return Response.json({ ok: true });
+    }
+    if (url.includes("/issues/12/labels")) {
+      return new Response("missing labels", { status: 422 });
+    }
+    return Response.json({});
+  };
+
+  try {
+    const result = await processPullRequestReview(
+      {
+        GITHUB_TOKEN: "token",
+        AI_API_URL: "https://ai.example/review",
+        AI_API_KEY: "key",
+      },
+      {
+        action: "opened",
+        repository: { name: "repo", owner: { login: "owner" } },
+        pull_request: { number: 12, draft: false },
+      },
+    );
+
+    assert.equal(result.skipped, false);
+    assert.equal(result.passed, true);
   } finally {
     global.fetch = originalFetch;
   }

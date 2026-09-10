@@ -50,7 +50,11 @@ async function verifyGitHubSignature(body, signatureHeader, secret) {
   return diff === 0;
 }
 
-async function githubApiRequest(env, path, { method = "GET", body, headers = {} } = {}) {
+async function githubApiRequest(
+  env,
+  path,
+  { method = "GET", body, headers = {}, nonFatalStatuses = [] } = {},
+) {
   const response = await fetch(`https://api.github.com${path}`, {
     method,
     headers: {
@@ -63,6 +67,9 @@ async function githubApiRequest(env, path, { method = "GET", body, headers = {} 
   });
 
   if (!response.ok) {
+    if (nonFatalStatuses.includes(response.status)) {
+      return response;
+    }
     const text = await response.text();
     throw new Error(`GitHub API request failed (${response.status}): ${text}`);
   }
@@ -170,17 +177,20 @@ async function processPullRequestReview(env, payload) {
   const reviewableByPath = parseReviewableLinesFromDiff(diff);
 
   const chunkResults = [];
-  for (let i = 0; i < chunks.length; i += 1) {
-    const prompt = createChunkPrompt({
-      owner,
-      repo,
-      pullNumber,
-      chunkIndex: i,
-      totalChunks: chunks.length,
-      diffChunk: chunks[i],
-    });
-    chunkResults.push(await requestAIReview(env, prompt));
-  }
+  const chunkReviewRequests = chunks.map((chunk, i) =>
+    requestAIReview(
+      env,
+      createChunkPrompt({
+        owner,
+        repo,
+        pullNumber,
+        chunkIndex: i,
+        totalChunks: chunks.length,
+        diffChunk: chunk,
+      }),
+    ),
+  );
+  chunkResults.push(...(await Promise.all(chunkReviewRequests)));
 
   const finalDecision = await requestAIReview(
     env,
@@ -233,6 +243,7 @@ async function processPullRequestReview(env, payload) {
 
   await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/labels`, {
     method: "POST",
+    nonFatalStatuses: [404, 422],
     body: JSON.stringify({ labels: [...tags] }),
   });
 
