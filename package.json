@@ -1,0 +1,17 @@
+{
+  "name": "review-my-code",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker GitHub PR AI review bot",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://localhost:26831/halowarden/review-my-code"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
