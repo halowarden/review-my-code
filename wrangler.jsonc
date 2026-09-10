@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "review-my-code-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-10",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Only CPU time is billed on Workers; time spent waiting on GitHub or the AI
+  // endpoint is free. Logs are needed to see skipped/failed reviews.
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 }
+  },
+
+  // The webhook handler enqueues a job and answers GitHub within milliseconds.
+  // The consumer gets up to 15 minutes of wall time per batch for the AI calls.
+  // Create the queue once: `npx wrangler queues create review-my-code-reviews`.
+  "queues": {
+    "producers": [{ "queue": "review-my-code-reviews", "binding": "REVIEW_QUEUE" }],
+    "consumers": [
+      {
+        "queue": "review-my-code-reviews",
+        "max_batch_size": 1,
+        "max_batch_timeout": 0,
+        "max_retries": 2,
+        "max_concurrency": 3
+      }
+    ]
+  },
+
+  // Optional: remembers reviewed head SHAs so redelivered or replayed webhooks
+  // are skipped for the price of one KV read. Create with
+  // `npx wrangler kv namespace create REVIEW_STATE` and paste the id below,
+  // or delete this block to run without it.
+  "kv_namespaces": [{ "binding": "REVIEW_STATE", "id": "22ad7d77f040442c97c97920e2e4fc3f" }],
+
+  // Non-secret tuning. Secrets (GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, AI_API_URL,
+  // AI_API_KEY) go through `npx wrangler secret put <NAME>`.
+  "vars": {
+    "AI_MODEL": "qwen3.8-max",
+    "AI_PARAMS": "{\"temperature\":0.1,\"max_tokens\":8000,\"response_format\":{\"type\":\"json_object\"},\"enable_thinking\":false}",
+    "AI_MAX_CHUNK_CHARS": "80000",
+    "AI_MAX_CHUNKS": "8",
+    "AI_CONCURRENCY": "3"
+  }
+}
