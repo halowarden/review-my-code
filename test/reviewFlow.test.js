@@ -791,6 +791,9 @@ test("all chunks failing throws a retriable error, posts nothing new, and marks 
 
 test("AI timeouts are retriable and honour AI_TIMEOUT_MS", async () => {
   const originalFetch = global.fetch;
+  // AbortSignal.timeout uses an unref'd timer, so on its own it would not keep the
+  // process alive while we wait for it (Node 22 exits and cancels the test run).
+  const keepAlive = setTimeout(() => {}, 10_000);
   global.fetch = async (url, options = {}) => {
     if (url.startsWith("https://ai.example/")) {
       assert.ok(options.signal instanceof AbortSignal, "AI request carries an abort signal");
@@ -813,6 +816,7 @@ test("AI timeouts are retriable and honour AI_TIMEOUT_MS", async () => {
       },
     );
   } finally {
+    clearTimeout(keepAlive);
     global.fetch = originalFetch;
   }
 });
