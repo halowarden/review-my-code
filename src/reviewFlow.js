@@ -1,4 +1,11 @@
 const MAX_DIFF_CHUNK_SIZE = 12000;
+const REVIEW_PROTOCOL = `Review protocol:
+- Prioritize correctness, security, reliability, compatibility, and regression risk over style.
+- Report only high/medium-confidence findings with a concrete failure mode from this diff.
+- Avoid duplicates and speculation; if unsure, omit the finding.
+- Consider edge cases (null/undefined, empty inputs, boundaries, async ordering, retries).
+- Validate contracts across changed files (API shapes, events, storage, env usage).
+- Keep findings actionable and concise.`;
 
 export function splitDiffIntoChunks(diff, maxChunkSize = MAX_DIFF_CHUNK_SIZE) {
   if (!diff || diff.length <= maxChunkSize) {
@@ -88,6 +95,7 @@ export function parseAIResponse(payload) {
 
 export function createChunkPrompt({ owner, repo, pullNumber, chunkIndex, totalChunks, diffChunk }) {
   return `You are an expert code-review agent. Review pull request ${owner}/${repo}#${pullNumber}.
+${REVIEW_PROTOCOL}
 
 Return strict JSON only with this schema:
 {
@@ -101,8 +109,8 @@ Return strict JSON only with this schema:
 }
 
 Rules:
-- Focus on correctness, security, data leaks, and broken behavior.
-- Keep inline comments precise and non-duplicative.
+- Focus on behavior and risk, not formatting.
+- Keep inline comments precise, non-duplicative, and tied to concrete defects.
 - Use only files/lines visible in this diff chunk.
 - If no issues, inlineComments must be [].
 - Add tags indicating result quality, such as "ai-review:passed" or "ai-review:needs-fixes".
@@ -114,6 +122,7 @@ ${diffChunk}`;
 export function createFinalDecisionPrompt({ owner, repo, pullNumber, chunkFindings }) {
   return `You are a final review adjudicator for PR ${owner}/${repo}#${pullNumber}.
 Given chunk-level findings from an earlier split diff review, remove duplicates and decide final status.
+${REVIEW_PROTOCOL}
 
 Return strict JSON only:
 {

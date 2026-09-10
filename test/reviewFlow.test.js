@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildMainComment,
+  createChunkPrompt,
+  createFinalDecisionPrompt,
   dedupeInlineComments,
   parseAIResponse,
   splitDiffIntoChunks,
@@ -55,6 +57,28 @@ test("parseAIResponse supports nested output JSON strings", () => {
   assert.equal(parsed.passed, true);
   assert.equal(parsed.summary, "Looks good");
   assert.deepEqual(parsed.tags, ["ai-review:passed"]);
+});
+
+test("review prompts include strict protocol guidance", () => {
+  const chunkPrompt = createChunkPrompt({
+    owner: "o",
+    repo: "r",
+    pullNumber: 1,
+    chunkIndex: 0,
+    totalChunks: 1,
+    diffChunk: "diff --git a/a.js b/a.js",
+  });
+  const finalPrompt = createFinalDecisionPrompt({
+    owner: "o",
+    repo: "r",
+    pullNumber: 1,
+    chunkFindings: ["x"],
+  });
+
+  assert.match(chunkPrompt, /Prioritize correctness, security, reliability, compatibility/);
+  assert.match(chunkPrompt, /Return strict JSON only/);
+  assert.match(finalPrompt, /remove duplicates and decide final status/);
+  assert.match(finalPrompt, /Report only high\/medium-confidence findings/);
 });
 
 test("buildMainComment includes pass/fail heading and findings", () => {
