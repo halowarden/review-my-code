@@ -141,3 +141,9 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Wrangler local secrets and build cache
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.wrangler/
