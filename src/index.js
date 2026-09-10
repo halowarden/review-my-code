@@ -37,7 +37,17 @@ async function verifyGitHubSignature(body, signatureHeader, secret) {
     ["sign"],
   );
   const digest = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-  return toHex(digest) === signature;
+  const actual = encoder.encode(toHex(digest));
+  const expected = encoder.encode(signature);
+  if (actual.length !== expected.length) {
+    return false;
+  }
+
+  let diff = 0;
+  for (let i = 0; i < actual.length; i += 1) {
+    diff |= actual[i] ^ expected[i];
+  }
+  return diff === 0;
 }
 
 async function githubApiRequest(env, path, { method = "GET", body, headers = {} } = {}) {
@@ -120,7 +130,7 @@ async function processPullRequestReview(env, payload) {
       owner,
       repo,
       pullNumber,
-      chunkFindings: chunkResults.map((result) => result.findings),
+      chunkFindings: chunkResults.flatMap((result) => result.findings),
     }),
   );
 
@@ -211,7 +221,8 @@ export default {
       const result = await processPullRequestReview(env, payload);
       return jsonResponse(result);
     } catch (error) {
-      return jsonResponse({ message: error.message }, 500);
+      console.error("Webhook processing failed", error);
+      return jsonResponse({ message: "Internal processing error" }, 500);
     }
   },
 };

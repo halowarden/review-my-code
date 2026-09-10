@@ -37,7 +37,14 @@ export function dedupeInlineComments(inlineComments = []) {
       (comment?.body ?? "").trim().toLowerCase(),
     ].join("|");
 
-    if (!comment?.path || !comment?.line || !comment?.body || seen.has(key)) {
+    if (
+      !comment?.path ||
+      comment?.line === undefined ||
+      comment?.line === null ||
+      Number.isNaN(Number(comment?.line)) ||
+      !comment?.body ||
+      seen.has(key)
+    ) {
       continue;
     }
     seen.add(key);
@@ -121,4 +128,3 @@ ${summary}
 **Findings**
 ${findingsBlock}`;
 }
-
