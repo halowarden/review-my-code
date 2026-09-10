@@ -214,6 +214,19 @@ async function processPullRequestReview(env, payload) {
     }
   }
 
+  const reviewComments = buildReviewComments(inlineComments, reviewableByPath);
+
+  if (reviewComments.length > 0) {
+    await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`, {
+      method: "POST",
+      body: JSON.stringify({
+        body: "Inline AI review comments.",
+        event: "COMMENT",
+        comments: reviewComments,
+      }),
+    });
+  }
+
   const commentResponse = await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/comments`, {
     method: "POST",
     body: JSON.stringify({
@@ -227,19 +240,6 @@ async function processPullRequestReview(env, payload) {
     headers: { Accept: "application/vnd.github.squirrel-girl-preview+json" },
     body: JSON.stringify({ content: passed ? "+1" : "-1" }),
   });
-
-  const reviewComments = buildReviewComments(inlineComments, reviewableByPath);
-
-  if (reviewComments.length > 0) {
-    await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`, {
-      method: "POST",
-      body: JSON.stringify({
-        body: "Inline AI review comments.",
-        event: "COMMENT",
-        comments: reviewComments,
-      }),
-    });
-  }
 
   await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/labels`, {
     method: "POST",
