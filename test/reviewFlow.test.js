@@ -13,6 +13,7 @@ import {
   parseAIParams,
   parseAIResponse,
   parseFinding,
+  reconcileInlineComments,
   resolveAIFormat,
   resolveAIRequestUrl,
   resolveReviewSettings,
@@ -95,10 +96,10 @@ function mockFetch({
       return Response.json({ login: "review-bot" });
     }
     if (url.includes("/pulls/12/reviews?") && options.method !== "POST") {
-      return Response.json(existingReviews);
+      return Response.json(url.includes("page=1") ? existingReviews : []);
     }
     if (url.includes("/pulls/12/comments?") && options.method !== "POST") {
-      return Response.json(existingInline);
+      return Response.json(url.includes("page=1") ? existingInline : []);
     }
     if (url.includes("/issues/12/reactions") && options.method !== "POST" && options.method !== "DELETE") {
       return Response.json(reactions);
@@ -455,6 +456,45 @@ test("parseFinding splits protocol-formatted lines and keeps unknown lines raw",
   assert.equal(raw.title, "Something odd");
 });
 
+test("reconcileInlineComments prefers the adjudicator and falls back to matching chunk comments", () => {
+  const chunk = [
+    { path: "a.js", line: 1, body: "keep" },
+    { path: "b.js", line: 9, body: "dropped finding" },
+  ];
+  const findings = ["🔴 🐛 **A** — a.js:1 — x", "🟡 🧹 **No location** — y"];
+  assert.deepEqual(reconcileInlineComments([{ path: "z.js", line: 2, body: "adj" }], chunk, findings), [
+    { path: "z.js", line: 2, body: "adj" },
+  ]);
+  assert.deepEqual(reconcileInlineComments([], chunk, findings), [{ path: "a.js", line: 1, body: "keep" }]);
+  assert.deepEqual(reconcileInlineComments(undefined, chunk, []), []);
+});
+
+test("multi-chunk review keeps chunk inline comments when the adjudicator omits them", async () => {
+  const { calls, restore } = mockFetch({
+    diff: fileDiff("a.js", 3) + fileDiff("b.js", 3),
+    ai: (prompt) =>
+      prompt.includes("final review adjudicator")
+        ? { passed: false, summary: "⛔", tags: [], findings: ["🔴 🐛 **A** — a.js:1 — x"] }
+        : {
+            passed: false,
+            summary: "chunk",
+            tags: [],
+            findings: ["🔴 🐛 **A** — a.js:1 — x", "🟡 🧹 **B** — b.js:1 — y"],
+            inlineComments: [
+              { path: "a.js", line: 1, body: "🔴 🐛 x" },
+              { path: "b.js", line: 1, body: "🟡 🧹 y" },
+            ],
+          },
+  });
+  try {
+    await processPullRequestReview({ ...BASE_ENV, AI_MAX_CHUNK_CHARS: "120" }, BASE_PAYLOAD);
+    const comments = postedReviewBody(calls).comments;
+    assert.deepEqual(comments.map((comment) => `${comment.path}:${comment.line}`), ["a.js:1"]);
+  } finally {
+    restore();
+  }
+});
+
 test("buildCategoryTable summarises findings per category", () => {
   const table = buildCategoryTable([
     parseFinding("🔴 🐛 **A** — a.js:1 — x"),
@@ -490,6 +530,8 @@ test("buildMainComment renders heading, scope, category table, collapsible findi
   assert.match(failedComment, /\*\*Findings \(2\)\*\*/);
   assert.match(failedComment, /<summary>🔴 🔒 <b>Token &lt;leak&gt;<\/b> — <a href="https:\/\/github.com\/owner\/repo\/blob\/abc123\/src\/a.js#L12"><code>src\/a.js:12<\/code><\/a><\/summary>/);
   assert.match(failedComment, /\n\nthe token is logged; redact it\n\n<\/details>/);
+  const escaped = buildMainComment({ summary: "s", findings: ["🟡 🧹 **T** — a.js:1 — use Map<string> not <img>"], passed: true });
+  assert.match(escaped, /use Map&lt;string&gt; not &lt;img&gt;/);
   assert.match(failedComment, /- plain line/);
   assert.match(failedComment, /Tags: `security`/);
 });

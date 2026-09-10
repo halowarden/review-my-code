@@ -666,6 +666,21 @@ function escapeHtml(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/**
+ * Inline comments for a multi-chunk review. The adjudicator is asked to return the
+ * surviving comments; when it returns none, fall back to the chunk comments whose
+ * path:line matches a surviving finding, so a terse model answer never drops them.
+ */
+export function reconcileInlineComments(decisionComments = [], chunkComments = [], findings = []) {
+  if (decisionComments.length) {
+    return decisionComments;
+  }
+  const locations = new Set(
+    findings.map((line) => parseFinding(line).location).filter(Boolean),
+  );
+  return chunkComments.filter((comment) => locations.has(`${comment.path}:${comment.line}`));
+}
+
 export function buildCategoryTable(parsedFindings) {
   const rows = CATEGORY_ORDER.map((emoji) => {
     const inCategory = parsedFindings.filter((finding) => finding.category === emoji);
@@ -709,7 +724,7 @@ export function buildMainComment({ summary, findings, passed, scope, tags = [], 
       }
       const category = finding.category ? `${finding.category === "🛡" ? "🛡️" : finding.category} ` : "";
       const where = finding.location ? ` — ${locationLink(finding.location, { owner, repo, headSha })}` : "";
-      return `<details>\n<summary>${finding.severity} ${category}<b>${escapeHtml(finding.title)}</b>${where}</summary>\n\n${finding.details}\n\n</details>`;
+      return `<details>\n<summary>${finding.severity} ${category}<b>${escapeHtml(finding.title)}</b>${where}</summary>\n\n${escapeHtml(finding.details)}\n\n</details>`;
     });
     sections.push(`**Findings (${parsed.length})**\n\n${blocks.join("\n")}`);
   }

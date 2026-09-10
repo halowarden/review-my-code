@@ -6,6 +6,7 @@ import {
   createFinalDecisionPrompt,
   dedupeInlineComments,
   extractAIOutput,
+  reconcileInlineComments,
   filterDiff,
   parseAIParams,
   parseAIResponse,
@@ -297,8 +298,9 @@ async function mapWithConcurrency(items, limit, worker) {
   let next = 0;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (next < items.length) {
-      const index = next;
-      next += 1;
+      // Claimed synchronously: JavaScript runs one task at a time and there is no
+      // await between the read and the increment, so two runners never share an index.
+      const index = next++;
       try {
         results[index] = { status: "fulfilled", value: await worker(items[index], index) };
       } catch (error) {
@@ -329,14 +331,31 @@ async function getBotLogin(env) {
   }
 }
 
+/** Follows page numbers until a short page; capped to keep a runaway PR bounded. */
+async function githubListAll(env, path, { maxPages = 10 } = {}) {
+  const items = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const separator = path.includes("?") ? "&" : "?";
+    const response = await githubApiRequest(env, `${path}${separator}per_page=100&page=${page}`);
+    const batch = await response.json();
+    if (!Array.isArray(batch) || batch.length === 0) {
+      break;
+    }
+    items.push(...batch);
+    if (batch.length < 100) {
+      break;
+    }
+  }
+  return items;
+}
+
 async function findMainReview(env, job, login) {
   if (!login) {
     return null;
   }
   const { owner, repo, pullNumber } = job;
-  const response = await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews?per_page=100`);
-  const reviews = await response.json();
-  const mine = (Array.isArray(reviews) ? reviews : []).filter(
+  const reviews = await githubListAll(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`);
+  const mine = reviews.filter(
     (review) => review?.user?.login === login && typeof review.body === "string" && review.body.includes(MAIN_MARKER),
   );
   return mine.length ? mine[mine.length - 1] : null;
@@ -347,10 +366,9 @@ async function deleteBotInlineComments(env, job, login) {
     return 0;
   }
   const { owner, repo, pullNumber } = job;
-  const response = await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/comments?per_page=100`);
-  const comments = await response.json();
+  const comments = await githubListAll(env, `/repos/${owner}/${repo}/pulls/${pullNumber}/comments`);
   let deleted = 0;
-  for (const comment of Array.isArray(comments) ? comments : []) {
+  for (const comment of comments) {
     if (comment?.user?.login === login && typeof comment.body === "string" && comment.body.includes(INLINE_MARKER)) {
       await githubApiRequest(env, `/repos/${owner}/${repo}/pulls/comments/${comment.id}`, {
         method: "DELETE",
@@ -502,9 +520,11 @@ async function runReview(env, job, settings, filtered, reviewedKey, login) {
   const tags = [...new Set([...chunkResults.flatMap((result) => result.tags), ...decision.tags].map((tag) => tag.trim()))];
   // Single chunk: the chunk's comments are final. Several chunks: the adjudicator
   // returns the comments whose findings survived, with severity reconciled.
-  const inlineComments = dedupeInlineComments(
-    chunkResults.length === 1 ? chunkResults[0].inlineComments : decision.inlineComments,
-  );
+  const chunkInlineComments = dedupeInlineComments(chunkResults.flatMap((result) => result.inlineComments));
+  const inlineComments =
+    chunkResults.length === 1
+      ? chunkInlineComments
+      : dedupeInlineComments(reconcileInlineComments(decision.inlineComments, chunkInlineComments, findings));
   const reviewComments = buildReviewComments(inlineComments, reviewableByPath);
   const scope = buildScopeLine({
     reviewedPaths: filtered.reviewedPaths,
