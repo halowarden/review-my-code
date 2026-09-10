@@ -9,6 +9,7 @@ export const DEFAULT_AI_CONCURRENCY = 3;
 export const DEFAULT_AI_TIMEOUT_MS = 240_000;
 export const DEFAULT_GITHUB_TIMEOUT_MS = 30_000;
 export const MAX_FILE_LIST_ENTRIES = 200;
+export const MAX_SCOPE_SKIPPED_ENTRIES = 8;
 
 // Files that are never worth an AI call: lockfiles, vendored/generated output, caches.
 export const DEFAULT_IGNORE_PATTERNS = [
@@ -587,9 +588,11 @@ export function buildScopeLine({ reviewedPaths = [], ignoredPaths = [], emptyPat
   if (totalChunks > 1) {
     parts[0] += ` in ${totalChunks} chunks`;
   }
-  const skipped = ignoredPaths.length + emptyPaths.length;
-  if (skipped) {
-    parts.push(`skipped ${skipped} (lockfiles, generated, binary, or no content changes)`);
+  const skippedPaths = [...ignoredPaths, ...emptyPaths];
+  if (skippedPaths.length) {
+    const shown = skippedPaths.slice(0, MAX_SCOPE_SKIPPED_ENTRIES).map((path) => `\`${path}\``);
+    const rest = skippedPaths.length - shown.length;
+    parts.push(`skipped ${skippedPaths.length}: ${shown.join(", ")}${rest > 0 ? ` and ${rest} more` : ""}`);
   }
   if (unreviewedChunks) {
     parts.push(`⚠️ ${unreviewedChunks} chunk${unreviewedChunks === 1 ? "" : "s"} not reviewed: diff exceeds the review budget`);

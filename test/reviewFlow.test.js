@@ -432,8 +432,10 @@ test("buildScopeLine reports coverage honestly", () => {
   assert.equal(buildScopeLine({ reviewedPaths: ["a"] }), "Reviewed: 1 file");
   assert.equal(
     buildScopeLine({ reviewedPaths: ["a", "b"], ignoredPaths: ["lock"], emptyPaths: ["r"], totalChunks: 3, failedChunks: 1, unreviewedChunks: 2 }),
-    "Reviewed: 2 files in 3 chunks — skipped 2 (lockfiles, generated, binary, or no content changes) — ⚠️ 2 chunks not reviewed: diff exceeds the review budget — ⚠️ 1 chunk not reviewed: AI request failed",
+    "Reviewed: 2 files in 3 chunks — skipped 2: `lock`, `r` — ⚠️ 2 chunks not reviewed: diff exceeds the review budget — ⚠️ 1 chunk not reviewed: AI request failed",
   );
+  const many = buildScopeLine({ reviewedPaths: ["a"], ignoredPaths: Array.from({ length: 10 }, (_, i) => `f${i}`) });
+  assert.match(many, /skipped 10: `f0`, `f1`, `f2`, `f3`, `f4`, `f5`, `f6`, `f7` and 2 more$/);
 });
 
 test("parseFinding splits protocol-formatted lines and keeps unknown lines raw", () => {
