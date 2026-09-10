@@ -192,11 +192,27 @@ error with the reason.
 
 ## Redeploying after changes
 
+Manually:
+
 ```bash
 npm test && npm run deploy
 ```
 
-Secrets and bindings survive redeploys. Changing `vars` in `wrangler.jsonc` requires a
+Automatically: `.github/workflows/deploy.yml` deploys every push to `main` (and can be run
+by hand from the Actions tab). It needs two repository secrets:
+
+- `CLOUDFLARE_ACCOUNT_ID` - from `npx wrangler whoami`
+- `CLOUDFLARE_API_TOKEN` - create at https://dash.cloudflare.com/profile/api-tokens with the
+  **Edit Cloudflare Workers** template (it covers Workers scripts, KV, and Queues)
+
+```bash
+gh secret set CLOUDFLARE_ACCOUNT_ID --repo <owner>/<repo>
+gh secret set CLOUDFLARE_API_TOKEN --repo <owner>/<repo>
+```
+
+`.github/workflows/ci.yml` runs the tests and a dry-run deploy on every pull request.
+
+Worker secrets and bindings survive redeploys. Changing `vars` in `wrangler.jsonc` requires a
 redeploy.
 
 ## Troubleshooting
