@@ -5,6 +5,7 @@ Cloudflare Worker GitHub bot for AI-powered pull request review.
 ## What it does
 
 - Accepts GitHub `pull_request` webhook events at `POST /webhook`
+- Optional: accepts local pre-push review requests at `POST /pre-push/review` guarded by a separate API key
 - Verifies the `x-hub-signature-256` HMAC before reading anything else
 - Enqueues a review job and answers GitHub with `202` within milliseconds
 - Queue consumer: fetches the PR diff, drops lockfiles/vendored/generated/binary files,
@@ -70,6 +71,8 @@ npx wrangler secret put GITHUB_TOKEN
 npx wrangler secret put GITHUB_WEBHOOK_SECRET
 npx wrangler secret put AI_API_URL
 npx wrangler secret put AI_API_KEY
+# optional, for local pre-push checks:
+npx wrangler secret put PRE_PUSH_API_KEY
 
 npm run deploy
 ```
@@ -89,6 +92,10 @@ Secrets (required, `wrangler secret put`):
 - `AI_API_URL` - AI endpoint. For the default OpenAI-compatible format this is the base
   URL (e.g. `https://host/compatible-mode/v1`); `/chat/completions` is appended automatically
 - `AI_API_KEY` - bearer key for that endpoint
+
+Secrets (optional):
+
+- `PRE_PUSH_API_KEY` - dedicated key for `POST /pre-push/review` (independent from `AI_API_KEY`)
 
 Optional AI request settings:
 
@@ -125,6 +132,67 @@ Bindings:
 - `REVIEW_STATE` - optional KV namespace remembering reviewed head SHAs and the id of the bot's
   PR reaction for 30 days. Without it, replacing 👀 relies on listing reactions, which needs
   `Issues: read` on private repositories.
+
+## Optional local pre-push review endpoint
+
+When `PRE_PUSH_API_KEY` is set, you can run AI review before `git push`:
+
+```bash
+curl -sS https://<worker>/pre-push/review \
+  -H "content-type: application/json" \
+  -H "x-review-api-key: <PRE_PUSH_API_KEY>" \
+  -d "$(jq -n --arg diff "$(git diff --patch --binary --no-color @{u}...HEAD)" '{owner:"local",repo:"local",diff:$diff}')"
+```
+
+Response shape:
+
+```json
+{
+  "passed": false,
+  "summary": "…",
+  "findings": ["…"],
+  "inlineComments": [],
+  "scope": "Reviewed: 3 files …"
+}
+```
+
+### `.git/hooks/pre-push` example
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+API_URL="https://<worker>/pre-push/review"
+API_KEY="<PRE_PUSH_API_KEY>"
+BASE="${PRE_PUSH_BASE:-@{u}}"
+
+if ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+  echo "pre-push review: no upstream yet, skipping"
+  exit 0
+fi
+
+DIFF="$(git diff --patch --binary --no-color "$BASE...HEAD")"
+if [ -z "$DIFF" ]; then
+  exit 0
+fi
+
+PAYLOAD="$(jq -n --arg owner "${GITHUB_OWNER:-local}" --arg repo "${GITHUB_REPO:-local}" --arg diff "$DIFF" '{owner:$owner,repo:$repo,diff:$diff}')"
+RESULT="$(curl -sS -f "$API_URL" -H "content-type: application/json" -H "x-review-api-key: $API_KEY" -d "$PAYLOAD")"
+
+echo "$RESULT" | jq -r '.summary'
+echo "$RESULT" | jq -r '.findings[]?' || true
+
+if [ "$(echo "$RESULT" | jq -r '.passed')" != "true" ]; then
+  echo "pre-push blocked: AI review reported issues"
+  exit 1
+fi
+```
+
+Install:
+
+```bash
+chmod +x .git/hooks/pre-push
+```
 
 ## Ignored by default
 
