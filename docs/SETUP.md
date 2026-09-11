@@ -235,12 +235,22 @@ if ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
   echo "pre-push review: no upstream yet, skipping"
   exit 0
 fi
+BASE_COMMIT="$(git merge-base "$BASE" HEAD)"
 
-DIFF="$(git diff --patch --binary --no-color "$BASE...HEAD")"
+DIFF="$(git diff --patch --binary --no-color "$BASE_COMMIT..HEAD")"
 [ -z "$DIFF" ] && exit 0
 
 PAYLOAD="$(jq -n --arg owner "<owner>" --arg repo "<repo>" --arg diff "$DIFF" '{owner:$owner,repo:$repo,diff:$diff}')"
-RESULT="$(curl -sS -f "$API_URL" -H "content-type: application/json" -H "x-review-api-key: $API_KEY" -d "$PAYLOAD")"
+TMP_RESPONSE="$(mktemp)"
+HTTP_STATUS="$(curl -sS -o "$TMP_RESPONSE" -w "%{http_code}" "$API_URL" -H "content-type: application/json" -H "x-review-api-key: ${API_KEY}" -d "$PAYLOAD")"
+if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+  echo "pre-push review request failed (HTTP $HTTP_STATUS)"
+  cat "$TMP_RESPONSE"
+  rm -f "$TMP_RESPONSE"
+  exit 1
+fi
+RESULT="$(cat "$TMP_RESPONSE")"
+rm -f "$TMP_RESPONSE"
 
 echo "$RESULT" | jq -r '.summary'
 echo "$RESULT" | jq -r '.findings[]?' || true

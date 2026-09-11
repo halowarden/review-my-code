@@ -135,13 +135,17 @@ Bindings:
 
 ## Optional local pre-push review endpoint
 
-When `PRE_PUSH_API_KEY` is set, you can run AI review before `git push`:
+When `PRE_PUSH_API_KEY` is set, you can run AI review before `git push` (requires an upstream branch):
 
 ```bash
+BASE="${PRE_PUSH_BASE:-@{u}}"
+git rev-parse --verify "$BASE" >/dev/null 2>&1 || { echo "no upstream branch"; exit 0; }
+BASE_COMMIT="$(git merge-base "$BASE" HEAD)"
+
 curl -sS https://<worker>/pre-push/review \
   -H "content-type: application/json" \
   -H "x-review-api-key: <PRE_PUSH_API_KEY>" \
-  -d "$(jq -n --arg diff "$(git diff --patch --binary --no-color @{u}...HEAD)" '{owner:"local",repo:"local",diff:$diff}')"
+  -d "$(jq -n --arg diff "$(git diff --patch --binary --no-color "$BASE_COMMIT..HEAD")" '{owner:"local",repo:"local",diff:$diff}')"
 ```
 
 Response shape:
@@ -170,14 +174,24 @@ if ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
   echo "pre-push review: no upstream yet, skipping"
   exit 0
 fi
+BASE_COMMIT="$(git merge-base "$BASE" HEAD)"
 
-DIFF="$(git diff --patch --binary --no-color "$BASE...HEAD")"
+DIFF="$(git diff --patch --binary --no-color "$BASE_COMMIT..HEAD")"
 if [ -z "$DIFF" ]; then
   exit 0
 fi
 
 PAYLOAD="$(jq -n --arg owner "${GITHUB_OWNER:-local}" --arg repo "${GITHUB_REPO:-local}" --arg diff "$DIFF" '{owner:$owner,repo:$repo,diff:$diff}')"
-RESULT="$(curl -sS -f "$API_URL" -H "content-type: application/json" -H "x-review-api-key: $API_KEY" -d "$PAYLOAD")"
+TMP_RESPONSE="$(mktemp)"
+HTTP_STATUS="$(curl -sS -o "$TMP_RESPONSE" -w "%{http_code}" "$API_URL" -H "content-type: application/json" -H "x-review-api-key: ${API_KEY}" -d "$PAYLOAD")"
+if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+  echo "pre-push review request failed (HTTP $HTTP_STATUS)"
+  cat "$TMP_RESPONSE"
+  rm -f "$TMP_RESPONSE"
+  exit 1
+fi
+RESULT="$(cat "$TMP_RESPONSE")"
+rm -f "$TMP_RESPONSE"
 
 echo "$RESULT" | jq -r '.summary'
 echo "$RESULT" | jq -r '.findings[]?' || true

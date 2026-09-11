@@ -943,7 +943,7 @@ async function reviewDiffForPrePush(env, diff, context = {}) {
     emptyPaths: filtered.emptyPaths,
     failedChunks,
     unreviewedChunks,
-    totalChunks: chunks.length,
+    totalChunks: allChunks.length,
   };
 }
 
@@ -981,13 +981,13 @@ function validatePrePushEnv(env) {
 }
 
 async function handlePrePushReview(request, env) {
-  if (!hasValidApiKey(request, env.PRE_PUSH_API_KEY)) {
-    return jsonResponse({ message: "Unauthorized" }, 401);
-  }
-
   const envError = validatePrePushEnv(env);
   if (envError) {
     return jsonResponse({ message: envError }, 500);
+  }
+
+  if (!hasValidApiKey(request, env.PRE_PUSH_API_KEY)) {
+    return jsonResponse({ message: "Unauthorized" }, 401);
   }
 
   const body = await readBodyWithLimit(request, MAX_WEBHOOK_BODY_BYTES);
@@ -1007,9 +1007,6 @@ async function handlePrePushReview(request, env) {
   }
   if (typeof payload.diff !== "string" || !payload.diff.trim()) {
     return jsonResponse({ message: "Field \"diff\" is required and must be a non-empty string" }, 400);
-  }
-  if (payload.diff.length > MAX_WEBHOOK_BODY_BYTES) {
-    return jsonResponse({ message: "Diff too large" }, 413);
   }
 
   const context = {

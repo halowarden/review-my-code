@@ -1275,6 +1275,18 @@ test("pre-push review endpoint requires a dedicated API key", async () => {
   }
 });
 
+test("pre-push review endpoint reports missing configuration", async () => {
+  const { calls, restore } = mockFetch();
+  try {
+    const response = await worker.fetch(prePushReviewRequest(JSON.stringify({ diff: SIMPLE_DIFF })), BASE_ENV);
+    assert.equal(response.status, 500);
+    assert.match((await response.json()).message, /PRE_PUSH_API_KEY/);
+    assert.equal(calls.length, 0, "misconfigured endpoint does not call AI or GitHub");
+  } finally {
+    restore();
+  }
+});
+
 test("pre-push review endpoint validates the request body", async () => {
   const { calls, restore } = mockFetch();
   try {
@@ -1321,7 +1333,11 @@ test("pre-push review endpoint runs AI review and returns findings", async () =>
     assert.equal(payload.passed, false);
     assert.match(payload.scope, /Reviewed: 1 file/);
     assert.equal(payload.findings.length, 1);
-    assert.equal(calls.filter((call) => call.url.includes("api.github.com")).length, 0, "pre-push review does not hit GitHub");
+    const githubCalls = calls.filter((call) => {
+      const host = new URL(call.url).host;
+      return host === "api.github.com";
+    });
+    assert.equal(githubCalls.length, 0, "pre-push review does not hit GitHub");
     assert.equal(calls.filter((call) => call.url.startsWith("https://ai.example/review")).length, 1);
   } finally {
     restore();
