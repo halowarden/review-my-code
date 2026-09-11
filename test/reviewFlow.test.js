@@ -659,7 +659,11 @@ test("single-chunk PR uses the chunk result directly and makes exactly one AI ca
 
     const labelsCall = calls.find((call) => call.url.endsWith("/issues/12/labels") && call.options.method === "POST");
     assert.deepEqual(JSON.parse(labelsCall.options.body).labels, ["ai-reviewed", "ai-review:needs-fixes"]);
-    const removeCall = calls.find((call) => call.options.method === "DELETE");
+    const removeCall = calls.find(
+      (call) =>
+        call.options.method === "DELETE" &&
+        call.url.endsWith(`/labels/${encodeURIComponent("ai-review:passed")}`),
+    );
     assert.match(removeCall.url, /labels\/ai-review%3Apassed$/);
 
   } finally {
@@ -788,6 +792,20 @@ test("all chunks failing throws a retriable error, posts nothing new, and marks 
     });
     assert.equal(reviewCalls(calls).length, 0);
     assert.deepEqual(reactionContents(calls), ["eyes", "confused"]);
+    const labelDeletes = calls
+      .filter((call) => call.options.method === "DELETE" && call.url.includes("/labels/"))
+      .map((call) => decodeURIComponent(call.url.split("/labels/")[1]))
+      .sort();
+    assert.deepEqual(
+      labelDeletes,
+      ["ai-review:needs-fixes", "ai-review:passed", "ai-reviewed"],
+      "stale-tag regression: re-review start clears ai-reviewed even when review never completes",
+    );
+    assert.equal(
+      calls.some((call) => call.options.method === "POST" && call.url.endsWith("/issues/12/labels")),
+      false,
+      "stale-tag regression: incomplete re-review does not re-apply ai-reviewed",
+    );
     const puts = calls.filter((call) => call.options.method === "PUT");
     assert.match(JSON.parse(puts[puts.length - 1].options.body).body, /^## 😕 AI Review failed[\s\S]*retried automatically/);
   } finally {
@@ -1012,6 +1030,10 @@ test("a later run updates the existing bot review in place and replaces inline c
     const firstPutIndex = calls.indexOf(puts[0]);
     const firstAiIndex = calls.findIndex((call) => call.url.startsWith("https://ai.example/"));
     assert.ok(firstPutIndex < firstAiIndex, "the review is marked in progress before the AI is called");
+    const firstReviewedDelete = calls.findIndex(
+      (call) => call.options.method === "DELETE" && call.url.endsWith(`/labels/${encodeURIComponent("ai-reviewed")}`),
+    );
+    assert.ok(firstReviewedDelete !== -1 && firstReviewedDelete < firstAiIndex, "stale-tag regression: ai-reviewed is cleared at re-review start");
 
     const deleted = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/pulls/comments/"));
     assert.deepEqual(deleted.map((call) => call.url.split("/").pop()), ["7"], "only the bot's marked inline comments are deleted");
@@ -1022,6 +1044,8 @@ test("a later run updates the existing bot review in place and replaces inline c
     assert.match(followUp.body, /Inline comments refreshed for `abcdef0`/);
     assert.equal(followUp.comments.length, 1);
     assert.equal(followUp.commit_id, "abcdef0123");
+    const labelPosts = calls.filter((call) => call.options.method === "POST" && call.url.endsWith("/issues/12/labels"));
+    assert.deepEqual(JSON.parse(labelPosts[labelPosts.length - 1].options.body).labels, ["ai-reviewed", "ai-review:passed"]);
   } finally {
     restore();
   }
@@ -1184,8 +1208,8 @@ test("worker enqueues a signed pull_request delivery and answers 202 immediately
     const labelDeletes = calls.filter((call) => call.options.method === "DELETE" && call.url.includes("/labels/"));
     assert.deepEqual(
       labelDeletes.map((call) => decodeURIComponent(call.url.split("/labels/")[1])).sort(),
-      ["ai-review:needs-fixes", "ai-review:passed"],
-      "stale verdict labels are removed immediately",
+      ["ai-review:needs-fixes", "ai-review:passed", "ai-reviewed"],
+      "stale review labels are removed immediately",
     );
     assert.ok(
       calls.every((call) => call.url.endsWith("/user") || call.url.includes("/reactions") || call.url.includes("/labels/")),
