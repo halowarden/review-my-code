@@ -1144,6 +1144,14 @@ function webhookRequest(body, headers = {}) {
   });
 }
 
+function prePushReviewRequest(body, headers = {}) {
+  return new Request("https://bot.example/pre-push/review", {
+    method: "POST",
+    headers: { ...headers },
+    body,
+  });
+}
+
 test("worker rejects invalid configuration before doing any work", async () => {
   const { calls, restore } = mockFetch();
   try {
@@ -1248,6 +1256,89 @@ test("worker falls back to inline processing via waitUntil without a queue bindi
     assert.equal(background.length, 2, "👀 acknowledgement and the review itself both run via waitUntil");
     await Promise.all(background);
     assert.equal(reviewCalls(calls).length, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("pre-push review endpoint requires a dedicated API key", async () => {
+  const { calls, restore } = mockFetch();
+  try {
+    const response = await worker.fetch(prePushReviewRequest(JSON.stringify({ diff: SIMPLE_DIFF })), {
+      ...BASE_ENV,
+      PRE_PUSH_API_KEY: "pre-push-secret",
+    });
+    assert.equal(response.status, 401);
+    assert.equal(calls.length, 0, "unauthorized request does not call AI or GitHub");
+  } finally {
+    restore();
+  }
+});
+
+test("pre-push review endpoint reports missing configuration", async () => {
+  const { calls, restore } = mockFetch();
+  try {
+    const response = await worker.fetch(prePushReviewRequest(JSON.stringify({ diff: SIMPLE_DIFF })), BASE_ENV);
+    assert.equal(response.status, 500);
+    assert.match((await response.json()).message, /PRE_PUSH_API_KEY/);
+    assert.equal(calls.length, 0, "misconfigured endpoint does not call AI or GitHub");
+  } finally {
+    restore();
+  }
+});
+
+test("pre-push review endpoint validates the request body", async () => {
+  const { calls, restore } = mockFetch();
+  try {
+    const response = await worker.fetch(prePushReviewRequest(JSON.stringify({}), { "x-review-api-key": "pre-push-secret" }), {
+      ...BASE_ENV,
+      PRE_PUSH_API_KEY: "pre-push-secret",
+    });
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).message, /"diff" is required/i);
+    assert.equal(calls.length, 0, "invalid request body does not call AI or GitHub");
+  } finally {
+    restore();
+  }
+});
+
+test("pre-push review endpoint runs AI review and returns findings", async () => {
+  const { calls, restore } = mockFetch({
+    ai: () => ({
+      passed: false,
+      summary: "Needs fixes",
+      tags: ["security"],
+      findings: ["🔴 🔒 **Hardcoded secret** — src/a.js:1 — secret can leak; remove it."],
+      inlineComments: [{ path: "a.js", line: 1, body: "🔴 🔒 Remove hardcoded secret" }],
+    }),
+  });
+  try {
+    const response = await worker.fetch(
+      prePushReviewRequest(
+        JSON.stringify({
+          owner: "owner",
+          repo: "repo",
+          diff: SIMPLE_DIFF,
+        }),
+        { "x-review-api-key": "test-pre-push-key" },
+      ),
+      {
+        ...BASE_ENV,
+        PRE_PUSH_API_KEY: "test-pre-push-key",
+      },
+    );
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.skipped, false);
+    assert.equal(payload.passed, false);
+    assert.match(payload.scope, /Reviewed: 1 file/);
+    assert.equal(payload.findings.length, 1);
+    const githubCalls = calls.filter((call) => {
+      const host = new URL(call.url).host;
+      return host === "api.github.com";
+    });
+    assert.equal(githubCalls.length, 0, "pre-push review does not hit GitHub");
+    assert.equal(calls.filter((call) => call.url.startsWith("https://ai.example/review")).length, 1);
   } finally {
     restore();
   }

@@ -28,6 +28,7 @@ const RETRY_DELAY_SECONDS = 60;
 const MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024;
 const SIGNATURE_HEADER_PATTERN = /^sha256=[0-9a-f]{64}$/i;
 const REVIEWED_MARKER_TTL_SECONDS = 30 * 24 * 60 * 60;
+const PRE_PUSH_REVIEW_PATH = "/pre-push/review";
 
 function log(level, message, fields = {}) {
   const line = JSON.stringify({ message, ...fields });
@@ -148,6 +149,33 @@ function constantTimeEqual(a, b) {
     diff |= a[i] ^ b[i];
   }
   return diff === 0;
+}
+
+function extractApiKey(request) {
+  const explicit = request.headers.get("x-review-api-key");
+  if (explicit && explicit.trim()) {
+    return explicit.trim();
+  }
+  const authorization = request.headers.get("authorization") ?? "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+function hasValidApiKey(request, expected) {
+  if (!expected || !String(expected).trim()) {
+    return false;
+  }
+  const candidate = extractApiKey(request);
+  if (!candidate) {
+    return false;
+  }
+  const encoder = new TextEncoder();
+  const actual = encoder.encode(candidate);
+  const required = encoder.encode(String(expected).trim());
+  if (actual.length !== required.length) {
+    return false;
+  }
+  return constantTimeEqual(actual, required);
 }
 
 async function githubApiRequest(env, path, { method = "GET", body, headers = {}, nonFatalStatuses = [] } = {}) {
@@ -807,6 +835,118 @@ export async function processPullRequestReview(env, payload) {
   return processReviewJob(env, job);
 }
 
+async function reviewDiffForPrePush(env, diff, context = {}) {
+  const settings = resolveReviewSettings(env);
+  const filtered = filterDiff(diff, settings.ignorePatterns);
+  const owner = typeof context.owner === "string" && context.owner.trim() ? context.owner.trim() : "local";
+  const repo = typeof context.repo === "string" && context.repo.trim() ? context.repo.trim() : "repository";
+  const pullNumber = Number.isInteger(context.pullNumber) && context.pullNumber > 0 ? context.pullNumber : 0;
+
+  if (!filtered.diff) {
+    return {
+      skipped: true,
+      reason: "nothing-to-review",
+      passed: true,
+      summary: "No reviewable changes found in the pushed commits.",
+      tags: [],
+      findings: [],
+      inlineComments: [],
+      scope: buildScopeLine({
+        reviewedPaths: filtered.reviewedPaths,
+        ignoredPaths: filtered.ignoredPaths,
+        emptyPaths: filtered.emptyPaths,
+      }),
+      reviewedPaths: filtered.reviewedPaths,
+      ignoredPaths: filtered.ignoredPaths,
+      emptyPaths: filtered.emptyPaths,
+      failedChunks: 0,
+      unreviewedChunks: 0,
+      totalChunks: 0,
+    };
+  }
+
+  const allChunks = splitDiffIntoChunks(filtered.diff, settings.maxChunkChars);
+  const chunks = allChunks.slice(0, settings.maxChunks);
+  const unreviewedChunks = allChunks.length - chunks.length;
+  const chunkOutcomes = await mapWithConcurrency(chunks, settings.concurrency, (chunk, index) =>
+    requestAIReview(
+      env,
+      createChunkPrompt({
+        owner,
+        repo,
+        pullNumber,
+        chunkIndex: index,
+        totalChunks: chunks.length,
+        diffChunk: chunk,
+        reviewedPaths: filtered.reviewedPaths,
+        ignoredPaths: filtered.ignoredPaths,
+      }),
+    ),
+  );
+
+  const chunkResults = [];
+  let failedChunks = 0;
+  let firstFailure = null;
+  chunkOutcomes.forEach((outcome) => {
+    if (outcome.status === "fulfilled") {
+      chunkResults.push(outcome.value);
+      return;
+    }
+    failedChunks += 1;
+    firstFailure ??= outcome.reason;
+  });
+  if (chunkResults.length === 0) {
+    throw firstFailure ?? new ReviewError("All chunk reviews failed", { retriable: true });
+  }
+
+  const decision =
+    chunkResults.length === 1
+      ? chunkResults[0]
+      : await requestAIReview(
+          env,
+          createFinalDecisionPrompt({
+            owner,
+            repo,
+            pullNumber,
+            chunkFindings: chunkResults.flatMap((result) => result.findings),
+            chunkInlineComments: dedupeInlineComments(chunkResults.flatMap((result) => result.inlineComments)),
+            totalChunks: chunks.length,
+            reviewedChunks: chunkResults.length,
+          }),
+        );
+
+  const findings = decision.findings.length ? decision.findings : chunkResults.flatMap((result) => result.findings);
+  const chunkInlineComments = dedupeInlineComments(chunkResults.flatMap((result) => result.inlineComments));
+  const inlineComments =
+    chunkResults.length === 1
+      ? chunkInlineComments
+      : dedupeInlineComments(reconcileInlineComments(decision.inlineComments, chunkInlineComments, findings));
+  const tags = [...new Set([...chunkResults.flatMap((result) => result.tags), ...decision.tags].map((tag) => tag.trim()))];
+
+  return {
+    skipped: false,
+    passed: decision.passed,
+    summary: decision.summary,
+    tags,
+    findings,
+    inlineComments,
+    scope: buildScopeLine({
+      reviewedPaths: filtered.reviewedPaths,
+      ignoredPaths: filtered.ignoredPaths,
+      emptyPaths: filtered.emptyPaths,
+      totalChunks: allChunks.length,
+      failedChunks,
+      unreviewedChunks,
+    }),
+    reviewedPaths: filtered.reviewedPaths,
+    ignoredPaths: filtered.ignoredPaths,
+    emptyPaths: filtered.emptyPaths,
+    failedChunks,
+    unreviewedChunks,
+    totalChunks: allChunks.length,
+  };
+}
+
 function validateEnv(env) {
   if (!env.GITHUB_TOKEN || !env.GITHUB_WEBHOOK_SECRET || !env.AI_API_URL || !env.AI_API_KEY) {
     return "Missing required environment variables";
@@ -822,13 +962,80 @@ function validateEnv(env) {
   return null;
 }
 
+function validatePrePushEnv(env) {
+  if (!env.AI_API_URL || !env.AI_API_KEY) {
+    return "Missing required environment variables: AI_API_URL and AI_API_KEY";
+  }
+  if (!env.PRE_PUSH_API_KEY) {
+    return "Missing required environment variables: PRE_PUSH_API_KEY";
+  }
+  try {
+    parseAIParams(env.AI_PARAMS);
+    resolveAIFormat(env.AI_API_FORMAT);
+    resolveReviewSettings(env);
+  } catch (error) {
+    log("error", "Invalid pre-push environment configuration", { error: error.message });
+    return `Invalid environment configuration: ${error.message}`;
+  }
+  return null;
+}
+
+async function handlePrePushReview(request, env) {
+  const envError = validatePrePushEnv(env);
+  if (envError) {
+    return jsonResponse({ message: envError }, 500);
+  }
+
+  if (!hasValidApiKey(request, env.PRE_PUSH_API_KEY)) {
+    return jsonResponse({ message: "Unauthorized" }, 401);
+  }
+
+  const body = await readBodyWithLimit(request, MAX_WEBHOOK_BODY_BYTES);
+  if (body === null) {
+    return jsonResponse({ message: "Payload too large" }, 413);
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(body || "{}");
+  } catch {
+    return jsonResponse({ message: "Invalid JSON body" }, 400);
+  }
+
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return jsonResponse({ message: "Request body must be a JSON object" }, 400);
+  }
+  if (typeof payload.diff !== "string" || !payload.diff.trim()) {
+    return jsonResponse({ message: "Field \"diff\" is required and must be a non-empty string" }, 400);
+  }
+
+  const context = {
+    owner: payload.owner,
+    repo: payload.repo,
+    pullNumber: payload.pullNumber,
+  };
+
+  try {
+    const result = await reviewDiffForPrePush(env, payload.diff, context);
+    return jsonResponse(result, 200);
+  } catch (error) {
+    log("error", "Pre-push review failed", { error: error.message });
+    if (error instanceof ReviewError) {
+      return jsonResponse({ message: error.message, retriable: error.retriable }, error.status ?? 502);
+    }
+    return jsonResponse({ message: "Pre-push review failed", retriable: isRetriableError(error) }, 502);
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
-    if (request.method !== "POST") {
-      return jsonResponse({ message: "Use POST /webhook" }, 405);
-    }
-
     const url = new URL(request.url);
+    if (request.method !== "POST") {
+      return jsonResponse({ message: "Use POST /webhook or POST /pre-push/review" }, 405);
+    }
+    if (url.pathname === PRE_PUSH_REVIEW_PATH) {
+      return handlePrePushReview(request, env);
+    }
     if (url.pathname !== "/webhook") {
       return jsonResponse({ message: "Not found" }, 404);
     }

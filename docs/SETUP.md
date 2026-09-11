@@ -113,6 +113,7 @@ Store the connection (the URL is the base URL, without `/chat/completions`):
 ```bash
 npx wrangler secret put AI_API_URL      # e.g. https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
 npx wrangler secret put AI_API_KEY
+npx wrangler secret put PRE_PUSH_API_KEY # optional: enables POST /pre-push/review for local git hooks
 ```
 
 Pick the model and parameters in `wrangler.jsonc` under `vars` (not secret):
@@ -214,6 +215,53 @@ Automatically, with Cloudflare Workers Builds (no Cloudflare token in GitHub nee
 
 Worker secrets and bindings survive redeploys. Changing `vars` in `wrangler.jsonc` requires a
 redeploy.
+
+## Optional: local pre-push review hook
+
+With `PRE_PUSH_API_KEY` set, the Worker exposes `POST /pre-push/review`, protected by
+that separate key (independent from `AI_API_KEY`).
+
+Create `.git/hooks/pre-push`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+API_URL="https://<worker-url>/pre-push/review"
+API_KEY="<PRE_PUSH_API_KEY>"
+BASE="${PRE_PUSH_BASE:-@{u}}"
+
+if ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+  echo "pre-push review: no upstream yet, skipping"
+  exit 0
+fi
+BASE_COMMIT="$(git merge-base "$BASE" HEAD)"
+
+DIFF="$(git diff --patch --binary --no-color "$BASE_COMMIT..HEAD")"
+[ -z "$DIFF" ] && exit 0
+
+PAYLOAD="$(jq -n --arg owner "<owner>" --arg repo "<repo>" --arg diff "$DIFF" '{owner:$owner,repo:$repo,diff:$diff}')"
+TMP_RESPONSE="$(mktemp)"
+HTTP_STATUS="$(curl -sS -o "$TMP_RESPONSE" -w "%{http_code}" "$API_URL" -H "content-type: application/json" -H "x-review-api-key: ${API_KEY}" -d "$PAYLOAD")"
+if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+  echo "pre-push review request failed (HTTP $HTTP_STATUS)"
+  cat "$TMP_RESPONSE"
+  rm -f "$TMP_RESPONSE"
+  exit 1
+fi
+RESULT="$(cat "$TMP_RESPONSE")"
+rm -f "$TMP_RESPONSE"
+
+echo "$RESULT" | jq -r '.summary'
+echo "$RESULT" | jq -r '.findings[]?' || true
+[ "$(echo "$RESULT" | jq -r '.passed')" = "true" ] || exit 1
+```
+
+Then enable it:
+
+```bash
+chmod +x .git/hooks/pre-push
+```
 
 ## Troubleshooting
 
