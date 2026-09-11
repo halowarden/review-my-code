@@ -460,7 +460,7 @@ async function setPullRequestReaction(env, job, content, login) {
 
 async function clearResultLabels(env, job) {
   const { owner, repo, pullNumber } = job;
-  for (const label of [REVIEW_LABELS.passed, REVIEW_LABELS.needsFixes]) {
+  for (const label of [REVIEW_LABELS.reviewed, REVIEW_LABELS.passed, REVIEW_LABELS.needsFixes]) {
     await githubApiRequest(env, `/repos/${owner}/${repo}/issues/${pullNumber}/labels/${encodeURIComponent(label)}`, {
       method: "DELETE",
       nonFatalStatuses: [403, 404, 422],
