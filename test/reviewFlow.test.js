@@ -980,6 +980,37 @@ test("REVIEW_STATE marker skips already reviewed heads and is written after post
   }
 });
 
+test("REVIEW_STATE skips duplicate put when reaction is unchanged (e.g. webhook followed by queue job)", async () => {
+  const store = new Map();
+  const puts = [];
+  const deletes = [];
+  const kv = {
+    get: async (key) => store.get(key)?.value ?? null,
+    put: async (key, value, options) => {
+      puts.push({ key, value, options });
+      store.set(key, { value, options });
+    },
+    delete: async (key) => {
+      deletes.push(key);
+      store.delete(key);
+    },
+  };
+  // Simulate webhook having already set eyes:
+  store.set("reaction:owner/repo/12", { value: JSON.stringify({ id: 1001, content: "eyes" }) });
+
+  const { calls, restore } = mockFetch({ reactionsStatus: 403, pullJson: { head: { sha: "def" } } });
+  try {
+    await processReviewJob({ ...BASE_ENV, REVIEW_STATE: kv }, { owner: "owner", repo: "repo", pullNumber: 12, headSha: "def" });
+    // When processReviewJob runs (setPullRequestReaction 'eyes'), it must NOT write 'eyes' to KV again.
+    assert.equal(puts.filter((p) => p.key === "reaction:owner/repo/12" && JSON.parse(p.value).content === "eyes").length, 0, "no duplicate put for eyes");
+    assert.equal(puts.filter((p) => p.key === "reaction:owner/repo/12").length, 1, "exactly 1 reaction put (final verdict)");
+    assert.equal(puts.filter((p) => p.key.startsWith("reviewed:")).length, 1, "reviewed marker put");
+    assert.equal(deletes.length, 0, "no delete calls");
+  } finally {
+    restore();
+  }
+});
+
 test("old bot reactions on the PR are removed before the new one is added", async () => {
   const { calls, restore } = mockFetch({
     reactions: [
