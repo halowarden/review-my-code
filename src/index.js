@@ -430,9 +430,11 @@ async function setPullRequestReaction(env, job, content, login) {
   const stateKey = `reaction:${owner}/${repo}/${pullNumber}`;
   try {
     let remembered = null;
+    let previousRaw = null;
     if (env.REVIEW_STATE) {
       try {
-        remembered = JSON.parse((await env.REVIEW_STATE.get(stateKey)) ?? "null");
+        previousRaw = await env.REVIEW_STATE.get(stateKey);
+        remembered = JSON.parse(previousRaw ?? "null");
       } catch {
         remembered = null;
       }
@@ -476,8 +478,11 @@ async function setPullRequestReaction(env, job, content, login) {
 
     if (env.REVIEW_STATE) {
       if (content && remembered?.id) {
-        await env.REVIEW_STATE.put(stateKey, JSON.stringify(remembered), { expirationTtl: REVIEWED_MARKER_TTL_SECONDS });
-      } else if (!content) {
+        const nextRaw = JSON.stringify(remembered);
+        if (nextRaw !== previousRaw) {
+          await env.REVIEW_STATE.put(stateKey, nextRaw, { expirationTtl: REVIEWED_MARKER_TTL_SECONDS });
+        }
+      } else if (!content && previousRaw !== null) {
         await env.REVIEW_STATE.delete(stateKey);
       }
     }
